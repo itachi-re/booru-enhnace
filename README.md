@@ -1,113 +1,88 @@
 # Booru Enhancer
 
-A modular userscript that upgrades the browsing experience on Danbooru-, Gelbooru-, and
-Moebooru-family imageboards: original-quality media loading, one-click downloads with smart
-naming, a fullscreen viewer, tag tools, blacklist filtering, infinite scroll, reverse image
-search, and a proper settings panel.
+A single-file userscript that adds a consistent set of quality-of-life tools on top of Danbooru, Gelbooru, Moebooru, and e621-style booru sites: original-quality media loading, smart downloads, a fullscreen viewer, tag tooling, blacklist filtering, infinite scroll, and reverse image search — all behind one settings panel.
 
-## Install
+> Install via [Tampermonkey](https://www.tampermonkey.net/), [Violentmonkey](https://violentmonkey.github.io/), or any compatible userscript manager.
 
-1. Install a userscript manager: **Violentmonkey** (primary target), Tampermonkey, or ScriptCat.
-2. Create a new script and paste in `booru-enhancer.user.js`, or point your manager at the raw
-   file URL if you're hosting it (GitHub raw, a Gist, etc.) — the `@match` list will pick it up
-   automatically.
-3. Visit any supported site. A small toolbar appears bottom-right by default; click the gear
-   icon to open Settings.
+## Supported sites
 
-## Supported sites out of the box
+| Engine | Supported sites |
+|---|---|
+| Danbooru | `danbooru.donmai.us`, `atfbooru.ninja`, and other `*.donmai.us` instances |
+| Gelbooru family | `gelbooru.com`, `safebooru.org`, `rule34.xxx`, `rule34.us`, `realbooru.com`, `tbib.org`, `xbooru.com`, `hypnohub.net` |
+| Moebooru | `konachan.com`, `konachan.net`, `yande.re`, `lolibooru.moe` |
+| e621 | `e621.net`, `e926.net` |
+| Sankaku | `chan.sankakucomplex.com`, `idol.sankakucomplex.com`, `beta.sankakucomplex.com` |
+| Generic fallback | Any other page — best-effort thumbnail/pagination detection, no site-specific assumptions |
 
-| Engine family | Sites | Data source |
-|---|---|---|
-| Danbooru | danbooru.donmai.us, atfbooru.ninja | `/posts/:id.json` API |
-| Gelbooru 0.2 clones | gelbooru.com, safebooru.org, rule34.xxx, realbooru.com, tbib.org, xbooru.com, hypnohub.net | `dapi` JSON API |
-| Moebooru | yande.re, konachan.com/.net, lolibooru.moe | `/post.json` API |
-| e621 | e621.net, e926.net | `/posts.json` API |
-| Generic fallback | Sankaku, rule34.us, and anything else | DOM heuristics |
+Each engine has its own adapter (post-ID resolution, thumbnail selectors, pagination detection, and API/HTML fetching). Unrecognized sites fall back to a generic adapter rather than failing outright.
 
-Adding a new site that already speaks one of the four APIs above is a config-only change (see
-"Extending" below). Anything else gets the generic DOM adapter automatically — no site will be
-left completely unsupported, just with reduced metadata.
+## Features
 
-## Architecture
+- **Original-quality media** — loads full-resolution images/video in place of compressed samples. Configurable per page (`always` / `post-page only` / `on-click` / `disabled`), with an option to never upscale past native resolution.
+- **Smart downloads** — customizable filename templates (e.g. `{character} - {artist} ({id})`), configurable tag delimiter and max character count in the filename, with automatic retries on failed downloads.
+- **Fullscreen viewer** — keyboard-driven post viewer with configurable fit mode, video autoplay/loop/mute, and remembered volume between videos.
+- **Infinite scroll** — replaces native pagination with a intersection-observer-based loader. Tracks already-seen post IDs to avoid duplicate loads, detects pagination loops (A→B→A or repeated identical pages) and stops instead of looping forever, and restores the native paginator automatically if a page load fails.
+- **Tag tools** — colorizes tags by category, shows post counts, and collapses long tag lists above a configurable threshold.
+- **Blacklist/whitelist filtering** — hide posts by tag (supports `rating:*` and `-tag` negation syntax), plus filters for videos, animated images, minimum resolution, and AI-generated content.
+- **Hover preview** — preview a post without leaving the gallery grid.
+- **Reverse image search** — one-click lookup via SauceNAO.
+- **Configurable grid layout** — adjustable thumbnail size, grid density/columns, and gap spacing, with a compact mode.
+- **Keybinds** — download, favorite, open original, toggle viewer, next/prev post, close viewer, play/pause video — all rebindable.
+- **SPA-navigation aware** — sites that swap content via `pushState`/AJAX (Danbooru, e621) are detected via a patched History API plus a `MutationObserver` fallback; the toolbar and post action bar refresh without duplicating UI, and gallery state (loaded post IDs, pagination identity) resets only on genuine navigation, not incidental DOM mutations.
+- **Resilient bootstrap** — every init stage (settings, adapter detection, UI, gallery binding, metadata enrichment, infinite scroll) is isolated in a `safeStage()` wrapper, so a failure in one module is logged and skipped rather than breaking the whole script.
+- **Settings panel + menu commands** — full settings UI, plus userscript-manager menu entries for toggling the script, resetting settings, and enabling debug logging.
 
-Everything lives under a single global `window.BE` namespace, split into independent layers:
+## Installation
 
-```
-BE.bus         event bus (pub/sub) — modules never call each other directly
-BE.store       persisted key/value storage (GM_setValue, sync-cached)
-BE.settings    typed, categorized config schema; settings UI renders itself from it
-BE.net         Promise wrapper around GM_xmlhttpRequest with retry/backoff
-BE.dom         DOM helpers (create/qs/qsa/debounce/throttle/IntersectionObserver helper)
-BE.adapters    per-engine adapters, normalizing every post into one `Post` shape
-BE.modules.*   feature modules: mediaLoader, downloader, naming, viewer, tagTools,
-               imageInfo, reverseSearch, sourceLinks, filters, favorites, gallery,
-               keybinds, ui, settingsPanel
-```
+1. Install a userscript manager (Tampermonkey or Violentmonkey recommended).
+2. Install [`booru-enhancer.user.js`](./booru-enhancer.user.js) — your manager should prompt automatically when opening the raw file.
+3. Visit any supported site. Open the settings panel from the on-page toolbar or your userscript manager's menu (**Booru Enhancer: Settings**).
 
-Every module reads only `BE.settings` and `BE.bus`; nothing reaches into another module's
-internals. That's what makes each feature independently toggleable and lets new modules bolt on
-without touching existing code.
+## Configuration
 
-### Why API-first instead of scraping the DOM?
+All settings are grouped by category in the in-page settings panel:
 
-Danbooru, e621, and the Gelbooru/Moebooru engines all expose stable, documented JSON endpoints.
-Adapters hit those directly for post metadata (tags, dimensions, md5, score, rating, source),
-which is far less fragile than parsing markup that changes with every theme update. DOM access
-is still used for two things only: finding *where* a post's `<img>` sits (to enrich it) and, for
-engines with no public API (Sankaku, rule34.us), building the best `Post` object it can straight
-from what's rendered.
+| Category | Covers |
+|---|---|
+| General | Enable/disable per site, theme, accent color, toolbar position |
+| Media | Original-media load mode, upscale prevention, hover preview, thumbnail quality |
+| Downloads | Filename template, tag delimiter, max characters, retry attempts, open-original behavior |
+| Viewer | Autoplay/loop/mute, remembered volume, fit mode |
+| Gallery | Infinite scroll, grid density, thumbnail size, grid gap, compact mode |
+| Tags | Colorization, post counts, collapse threshold |
+| Filters | Blacklist/whitelist, hide videos/animations, minimum resolution, AI-generated filter |
+| Keybinds | All keyboard shortcuts |
+| Debug | Verbose console logging |
 
-## Extending
+Settings are stored in the userscript manager's per-script storage via `GM_setValue`/`GM_getValue`, namespaced under `be:setting:*`. They persist across browser sessions; whether they sync between devices depends on your userscript manager's own storage/sync configuration.
 
-**Add a new engine adapter:**
+## Privacy & network requests
 
-```js
-BE.core.registerAdapter({
-  id: 'my-engine',
-  hostPattern: /myboorusite\.com$/,
-  priority: 10,
-  isPostPage: () => /* ... */,
-  getPostId: () => /* ... */,
-  getThumbElements: () => document.querySelectorAll('img.preview'),
-  getThumbPostId: (img) => /* ... */,
-  async fetchPost(id) { /* return a Post via emptyPost({...}) */ },
-  async fetchThumbBatch(ids) { /* return Post[] */ },
-  favoriteSelector: '.fav-button',
-  gridContainerSelector: '#posts',
-});
-```
+Booru Enhancer runs entirely client-side inside your userscript manager. It has no remote backend and does not send your browsing data anywhere the author controls.
 
-**Add a new feature module:** subscribe to `BE.bus` events (`post:loaded`, `media:swapped`,
-`download:*`, `favorite:changed`, `viewer:*`, `gallery:*`, `settings:changed`) and read/write
-`BE.settings`. Register any new options by adding entries to `BE.settings.SCHEMA` — the settings
-panel picks them up automatically, no UI code required.
+Depending on which features are active, the script may make requests to:
 
-**Add a new setting:** add one entry to `BE.settings.SCHEMA` with a category, type
-(`bool`/`select`/`color`/`range`/`number`/`text`/`textarea`), default, and label.
+- The current booru site, for post/gallery data and media
+- SauceNAO, for reverse image search
+- Any other domain listed in the script's `@connect` metadata
 
-## Deliberately not implemented yet
-
-The spec's "Future Features" list (cloud sync, tag analytics, ML tag suggestions, a duplicate
-finder, a local download database/statistics, a full plugin loader, custom themes beyond
-light/dark, i18n, offline caching) is intentionally **architecture-only** right now:
-
-- `BE.core.registerModule`-style registration (via `BE.bus` + `BE.settings.SCHEMA`) already *is*
-  the plugin API — it just needs an external loader (`@require`) pointed at a module file.
-- `BE.store` already namespaces keys per host, so a download database or dedup index is a new
-  module away, not a redesign.
-- Theming is centralized in one CSS block using custom properties (`--be-accent`, `--be-bg`,
-  etc.) and a single `data-be-theme` attribute, so more themes are a CSS-only addition.
-
-Building these out fully was out of scope here — the goal was a solid, working core plus an
-architecture that doesn't need to be reworked to add them later.
+Some features (e.g. favoriting) act through your existing logged-in session on the current site — the script never collects or transmits your credentials. If you want to audit exactly what it can reach, check the `@connect` block at the top of `booru-enhancer.user.js` alongside the source.
 
 ## Known limitations
 
-- **Favorites** re-use the site's own favorite button (so your existing session/auth handles it)
-  rather than reimplementing every engine's CSRF-protected favorite API; a local list mirrors the
-  state for instant UI feedback across sessions.
-- **Sankaku and rule34.us** run on the generic DOM-fallback adapter since they don't expose a
-  public, stable JSON API — metadata there is best-effort.
-- Infinite scroll works by fetching the next paginated URL and splicing its post grid into the
-  current page; it depends on each engine having a `rel="next"`/`.next` pagination link, which all
-  supported engines do.
+- `keys.commandPalette` appears in the settings schema (default `Ctrl+K`) but isn't wired up to any handler yet — reserved for a future command palette feature.
+- `iqdb.org` is declared under `@connect` but reverse image search currently only calls SauceNAO; IQDB support isn't implemented.
+- Metadata enrichment and infinite scroll depend on each adapter's ability to detect the gallery container and pagination controls — a site redesign upstream can require an adapter update.
+
+## Debugging
+
+Enable **Booru Enhancer: Toggle Debug Mode** from the userscript menu (or `debug.verboseLogging` in settings) for detailed console logging around initialization, adapter detection, pagination identity, and infinite-scroll loop detection. All log lines are prefixed `[Booru Enhancer]`.
+
+## Contributing
+
+Site adapters are self-contained (`BE.core.registerAdapter({...})`) and only need to implement post-ID resolution, thumbnail selectors, a gallery container selector, `fetchPost`/`fetchThumbBatch`, and pagination handling. PRs adding adapters for other booru engines are welcome.
+
+## License
+
+MIT © [itachi-re](https://github.com/itachi-re)
