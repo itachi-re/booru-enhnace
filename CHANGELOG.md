@@ -4,6 +4,17 @@ All notable changes to Booru Enhancer are documented here, based on the project'
 
 This project aims to follow [Keep a Changelog](https://keepachangelog.com/) conventions going forward.
 
+## [1.2.8]
+
+**Infinite-scroll "hang" root-cause fix.**
+
+### Fixed
+- `BE.net.request()` previously treated *any* non-2xx HTTP status (403/404/500, etc.) the same as a transient network failure, silently retrying it up to the configured retry count before rejecting. Several booru sites respond to "page past the last one" with a non-2xx status rather than an empty 200 page — the old behavior meant a request like that would burn through all its retries, reject, land in `loadNextPage()`'s catch block, and retry the *entire request* again every 5 seconds, indefinitely, because it could never reach the "no more pages" branch. This was very likely the underlying cause of infinite scroll appearing to hang or never stop. Only genuine network failures (`onerror`/`ontimeout`) and explicit rate-limiting (429) are retried now; any response that actually completed is resolved and handed to the caller to interpret, whatever its status code.
+- `BE.net.json()` updated accordingly — since `request()` no longer filters out non-2xx responses itself, `json()` now explicitly checks for a 2xx status and throws if the response didn't succeed.
+
+### Known issue in this release
+- `@version` in the userscript header was bumped to `1.2.8`, but the internal `BE.VERSION` constant was left at `'1.2.7'`. This isn't just cosmetic: it's the version string reported in exported settings JSON, and it's sent as the literal `User-Agent` (`BooruEnhancer/1.2.7 (userscript)`) on every request the e621/e926 adapter makes. Fix pending in a follow-up patch release.
+
 ## [1.2.7] — last month
 
 **Interaction & pagination regression fixes.**
@@ -205,6 +216,7 @@ Changed namespace and version.
 
 Initial release.
 
+[1.2.8]: https://github.com/itachi-re/booru-enhnace
 [1.2.7]: https://github.com/itachi-re/booru-enhnace
 [1.2.6]: https://github.com/itachi-re/booru-enhnace
 [1.2.5]: https://github.com/itachi-re/booru-enhnace
