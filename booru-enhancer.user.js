@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Booru Enhancer
 // @namespace    https://sleazyfork.org/en/scripts/587810-booru-enhancer
-// @version      1.2.7
+// @version      1.2.8
 // @description  Modular enhancement suite for Danbooru/Gelbooru/Moebooru-family booru sites — original-quality media, smart downloads, fullscreen viewer, tag tools, blacklist filtering, infinite scroll, reverse image search, and more.
 // @author       itachi-re
 // @license      MIT
@@ -447,6 +447,19 @@
 	 *  NETWORK
 	 * ============================================================ */
 	BE.net = {
+		// BUGFIX: this used to treat ANY non-2xx status (403/404/500/etc) the
+		// same as a transient network failure — silently retrying it `retries`
+		// times and only then rejecting. That's wrong for callers (pagination
+		// in particular) that need to see the real response/status: several
+		// booru sites answer "page past the last one" with a non-2xx status
+		// rather than an empty 200 page, and the old behaviour meant infinite
+		// scroll would burn through its retries, reject, land in loadNextPage's
+		// catch block, and retry the *whole request* again every 5s forever —
+		// it could never reach "no more pages", which is the root cause behind
+		// autoscroll appearing to hang/never stop. Only true network failures
+		// (onerror/ontimeout) and explicit rate-limiting (429) are retried
+		// here now; any response that actually completed is handed back to
+		// the caller to interpret, whatever its status code.
 		request(opts, retries = 0) {
 			return new Promise((resolve, reject) => {
 				const attempt = (n) => {
@@ -454,9 +467,7 @@
 						method: 'GET',
 						...opts,
 						onload: (res) => {
-							if (res.status >= 200 && res.status < 300) {
-								resolve(res);
-							} else if (res.status === 429) {
+							if (res.status === 429) {
 								const delay = Math.pow(2, (retries - n + 1)) * 1000;
 								BE.log.warn(`[Gallery] 429 Rate limit. Retrying in ${delay/1000}s...`);
 								if (n > 0) {
@@ -464,11 +475,9 @@
 								} else {
 									reject(new Error(`HTTP 429 Rate limit exceeded for ${opts.url}`));
 								}
-							} else if (n > 0) {
-								setTimeout(() => attempt(n - 1), 400 * (retries - n + 1));
-							} else {
-								reject(new Error(`HTTP ${res.status} for ${opts.url}`));
+								return;
 							}
+							resolve(res);
 						},
 						onerror: (err) => (n > 0 ? setTimeout(() => attempt(n - 1), 400 * (retries - n + 1)) : reject(err)),
 							ontimeout: (err) => (n > 0 ? setTimeout(() => attempt(n - 1), 400 * (retries - n + 1)) : reject(err))
@@ -477,10 +486,15 @@
 				attempt(retries);
 			});
 		},
-		async json(url, opts = {}) {
-			const res = await this.request({ url, headers: { Accept: 'application/json', ...(opts.headers || {}) }, ...opts }, opts.retries ?? 2);
-			return JSON.parse(res.responseText);
-		}
+ async json(url, opts = {}) {
+	 const res = await this.request({ url, headers: { Accept: 'application/json', ...(opts.headers || {}) }, ...opts }, opts.retries ?? 2);
+	 // request() now resolves on any completed response, so a non-2xx
+	 // status has to be checked explicitly here rather than assumed away.
+	 if (res.status < 200 || res.status >= 300) {
+		 throw new Error(`HTTP ${res.status} for ${url}`);
+	 }
+	 return JSON.parse(res.responseText);
+ }
 	};
 
 	/* ============================================================ *
@@ -489,9 +503,9 @@
 	function emptyPost(overrides = {}) {
 		return {
 			id: '', originalUrl: '', sampleUrl: '', previewUrl: '', mediaType: 'unknown',
-			width: 0, height: 0, fileSize: 0, md5: '', rating: 'unknown', score: 0, favCount: 0,
-			artists: [], characters: [], copyrights: [], generalTags: [], metaTags: [], allTags: [],
-			source: '', postUrl: location.href, createdAt: '', siteId: '', ...overrides,
+ width: 0, height: 0, fileSize: 0, md5: '', rating: 'unknown', score: 0, favCount: 0,
+ artists: [], characters: [], copyrights: [], generalTags: [], metaTags: [], allTags: [],
+ source: '', postUrl: location.href, createdAt: '', siteId: '', ...overrides,
 		};
 	}
 
@@ -1021,31 +1035,31 @@
 							favoriteSelector: '#add-to-favorites, #remove-from-favorites',
 							pagination: {
 								containerSelectors: ['#paginator', 'nav.paginator', 'section#paginating-nav'],
-						 getPageIdentity(url) {
-							 const u = safeURL(url);
-							 if (!u) return '1';
-							 return u.searchParams.get('page') || u.searchParams.get('b') || u.searchParams.get('a') || '1';
-						 },
-						 getNextUrl(doc) {
-							 const link = findFirstNextLink(doc, [
-								 'a[rel="next"]', 'a.next',
-								 '#paginator a[rel="next"]', 'nav.paginator a[rel="next"]',
-								 'section#paginating-nav a[rel="next"]',
-							 ]);
-							 return link?.href || null;
-						 },
-						 calculateNextUrl(currentUrl) {
-							 const u = safeURL(currentUrl);
-							 if (!u) return null;
-							 if (u.searchParams.has('b') || u.searchParams.has('a')) return null;
-							 const page = parseInt(u.searchParams.get('page') || '1', 10);
-							 u.searchParams.set('page', String(page + 1));
-							 return u.toString();
-						 },
-						 getPostIdentity(el) {
-							 const art = el.closest('article[id^="post_"]');
-							 return art?.id?.match(/post_(\d+)/)?.[1] || null;
-						 },
+								getPageIdentity(url) {
+									const u = safeURL(url);
+									if (!u) return '1';
+									return u.searchParams.get('page') || u.searchParams.get('b') || u.searchParams.get('a') || '1';
+								},
+								getNextUrl(doc) {
+									const link = findFirstNextLink(doc, [
+										'a[rel="next"]', 'a.next',
+										'#paginator a[rel="next"]', 'nav.paginator a[rel="next"]',
+										'section#paginating-nav a[rel="next"]',
+									]);
+									return link?.href || null;
+								},
+								calculateNextUrl(currentUrl) {
+									const u = safeURL(currentUrl);
+									if (!u) return null;
+									if (u.searchParams.has('b') || u.searchParams.has('a')) return null;
+									const page = parseInt(u.searchParams.get('page') || '1', 10);
+									u.searchParams.set('page', String(page + 1));
+									return u.toString();
+								},
+								getPostIdentity(el) {
+									const art = el.closest('article[id^="post_"]');
+									return art?.id?.match(/post_(\d+)/)?.[1] || null;
+								},
 							},
 	});
 
@@ -1117,86 +1131,86 @@
 							favoriteSelector: 'a[href*="favorite" i], button[class*="favorite" i]',
 							pagination: {
 								containerSelectors: ['.pagination', '#paginator', '.pagination-controls', 'nav.paginator'],
-								getPageIdentity(url) {
-									const u = safeURL(url);
-									if (!u) return '1';
-									return u.searchParams.get('pid') || u.searchParams.get('page') || '1';
-								},
-								getNextUrl(doc) {
-									// 1. Explicit next-page link is always the most trustworthy signal.
-									const link = findFirstNextLink(doc, [
-										'a[rel="next"]', 'a.next',
-										'a[aria-label*="next" i]', 'a[title*="next" i]',
-										'.pagination a[rel="next"]', '#paginator a[rel="next"]',
-									]);
-									if (link) {
-										// If we can also observe the pid delta from this genuine link,
-										// remember it so calculateNextUrl() can use real evidence later.
-										const curPidStr = safeURL(location.href)?.searchParams.get('pid');
-										const nextPidStr = safeURL(link.href)?.searchParams.get('pid');
-										if (curPidStr !== undefined && nextPidStr !== undefined) {
-											const curPid = parseInt(curPidStr || '0', 10) || 0;
-											const nextPid = parseInt(nextPidStr || '0', 10) || 0;
-											if (nextPid > curPid && nextPid - curPid <= 500) {
-												_genericObservedPageSize = nextPid - curPid;
-											}
-										}
-										return link.href;
-									}
+						 getPageIdentity(url) {
+							 const u = safeURL(url);
+							 if (!u) return '1';
+							 return u.searchParams.get('pid') || u.searchParams.get('page') || '1';
+						 },
+						 getNextUrl(doc) {
+							 // 1. Explicit next-page link is always the most trustworthy signal.
+							 const link = findFirstNextLink(doc, [
+								 'a[rel="next"]', 'a.next',
+								 'a[aria-label*="next" i]', 'a[title*="next" i]',
+								 '.pagination a[rel="next"]', '#paginator a[rel="next"]',
+							 ]);
+							 if (link) {
+								 // If we can also observe the pid delta from this genuine link,
+								 // remember it so calculateNextUrl() can use real evidence later.
+								 const curPidStr = safeURL(location.href)?.searchParams.get('pid');
+								 const nextPidStr = safeURL(link.href)?.searchParams.get('pid');
+								 if (curPidStr !== undefined && nextPidStr !== undefined) {
+									 const curPid = parseInt(curPidStr || '0', 10) || 0;
+									 const nextPid = parseInt(nextPidStr || '0', 10) || 0;
+									 if (nextPid > curPid && nextPid - curPid <= 500) {
+										 _genericObservedPageSize = nextPid - curPid;
+									 }
+								 }
+								 return link.href;
+							 }
 
-									// 2. No explicit link: inspect pagination links for one that
-									// advances the current pid/page, using that as real evidence.
-									const currentPid = parseInt(this.getPageIdentity(location.href), 10) || 0;
-									if (location.href.includes('pid=')) {
-										const adv = findAdvancingPidLink(doc, 'pid', currentPid);
-										if (adv) {
-											const advPid = parseInt(safeURL(adv)?.searchParams.get('pid') || '0', 10) || 0;
-											if (advPid > currentPid && advPid - currentPid <= 500) {
-												_genericObservedPageSize = advPid - currentPid;
-											}
-											return adv;
-										}
-									}
+							 // 2. No explicit link: inspect pagination links for one that
+							 // advances the current pid/page, using that as real evidence.
+							 const currentPid = parseInt(this.getPageIdentity(location.href), 10) || 0;
+							 if (location.href.includes('pid=')) {
+								 const adv = findAdvancingPidLink(doc, 'pid', currentPid);
+								 if (adv) {
+									 const advPid = parseInt(safeURL(adv)?.searchParams.get('pid') || '0', 10) || 0;
+									 if (advPid > currentPid && advPid - currentPid <= 500) {
+										 _genericObservedPageSize = advPid - currentPid;
+									 }
+									 return adv;
+								 }
+							 }
 
-									const currentPage = parseInt(safeURL(location.href)?.searchParams.get('page') || '1', 10) || 1;
-									const pageLinks = Array.from(doc.querySelectorAll('a[href*="page="]'));
-									const candidates = [];
-									for (const a of pageLinks) {
-										const u = safeURL(a.href);
-										if (!u) continue;
-										const pg = parseInt(u.searchParams.get('page') || '1', 10);
-										if (!isNaN(pg) && pg > currentPage) candidates.push({ href: a.href, pg });
-									}
-									if (candidates.length) {
-										candidates.sort((a, b) => a.pg - b.pg);
-										return candidates[0].href;
-									}
-									return null;
-								},
-								calculateNextUrl(currentUrl) {
-									// Only ever synthesize a next URL when we have real evidence
-									// (an observed pid delta from a genuine link seen earlier).
-									// Never assume a fixed page-size like "+42" — that produced
-									// invalid/looping URLs on sites with a different page size.
-									const u = safeURL(currentUrl);
-									if (!u) return null;
-									if (u.searchParams.has('page')) {
-										const page = parseInt(u.searchParams.get('page'), 10) || 1;
-										u.searchParams.set('page', String(page + 1));
-										return u.toString();
-									}
-									if (u.searchParams.has('pid') && _genericObservedPageSize) {
-										const pid = parseInt(u.searchParams.get('pid'), 10) || 0;
-										u.searchParams.set('pid', String(pid + _genericObservedPageSize));
-										return u.toString();
-									}
-									return null;
-								},
-								getPostIdentity(el) {
-									const a = el.closest('a');
-									const href = a?.getAttribute('href') || '';
-									return (href.match(/(\d{3,})/) || [])[0] || href || null;
-								},
+							 const currentPage = parseInt(safeURL(location.href)?.searchParams.get('page') || '1', 10) || 1;
+							 const pageLinks = Array.from(doc.querySelectorAll('a[href*="page="]'));
+							 const candidates = [];
+							 for (const a of pageLinks) {
+								 const u = safeURL(a.href);
+								 if (!u) continue;
+								 const pg = parseInt(u.searchParams.get('page') || '1', 10);
+								 if (!isNaN(pg) && pg > currentPage) candidates.push({ href: a.href, pg });
+							 }
+							 if (candidates.length) {
+								 candidates.sort((a, b) => a.pg - b.pg);
+								 return candidates[0].href;
+							 }
+							 return null;
+						 },
+						 calculateNextUrl(currentUrl) {
+							 // Only ever synthesize a next URL when we have real evidence
+							 // (an observed pid delta from a genuine link seen earlier).
+							 // Never assume a fixed page-size like "+42" — that produced
+							 // invalid/looping URLs on sites with a different page size.
+							 const u = safeURL(currentUrl);
+							 if (!u) return null;
+							 if (u.searchParams.has('page')) {
+								 const page = parseInt(u.searchParams.get('page'), 10) || 1;
+								 u.searchParams.set('page', String(page + 1));
+								 return u.toString();
+							 }
+							 if (u.searchParams.has('pid') && _genericObservedPageSize) {
+								 const pid = parseInt(u.searchParams.get('pid'), 10) || 0;
+								 u.searchParams.set('pid', String(pid + _genericObservedPageSize));
+								 return u.toString();
+							 }
+							 return null;
+						 },
+						 getPostIdentity(el) {
+							 const a = el.closest('a');
+							 const href = a?.getAttribute('href') || '';
+							 return (href.match(/(\d{3,})/) || [])[0] || href || null;
+						 },
 							},
 	});
 
@@ -2329,11 +2343,11 @@
 				border-radius: 4px;
 			}
 			/* Requirement 11–16: now that .be-thumb-wrap is reliably the
-			 * actual CSS grid item (not some unrelated ancestor), make sure
-			 * OUR grid sizing is what visibly governs it — many booru sites
-			 * give the equivalent native element a fixed width/float, which
-			 * would otherwise silently override grid-template-columns and
-			 * make thumbnailSize/gridDensity/gridGap changes invisible. */
+			   actual CSS grid item (not some unrelated ancestor), make sure
+			   OUR grid sizing is what visibly governs it — many booru sites
+			   give the equivalent native element a fixed width/float, which
+			   would otherwise silently override grid-template-columns and
+			   make thumbnailSize/gridDensity/gridGap changes invisible. */
 			.be-gallery-grid > .be-thumb-wrap,
 			.be-gallery-grid .be-thumb-wrap {
 				float: none !important;
@@ -2351,7 +2365,7 @@
 				object-fit: contain;
 			}
 			/* gallery.compactMode: previously toggled with no CSS consumer,
-			 * so it "saved" but never visibly did anything. */
+			   so it "saved" but never visibly did anything. */
 			.be-gallery-grid.be-compact-mode .be-thumb-wrap {
 				aspect-ratio: 1/1;
 				border-radius: 2px;
