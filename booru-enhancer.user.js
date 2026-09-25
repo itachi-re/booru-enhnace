@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Booru Enhancer
 // @namespace    https://sleazyfork.org/en/scripts/587810-booru-enhancer
-// @version      1.1.2
+// @version      1.2.5
 // @description  Modular enhancement suite for Danbooru/Gelbooru/Moebooru-family booru sites — original-quality media, smart downloads, fullscreen viewer, tag tools, blacklist filtering, infinite scroll, reverse image search, and more.
 // @author       itachi-re
 // @license      MIT
@@ -61,24 +61,33 @@
 
 /**
  * =============================================================================
- *  BOORU ENHANCER  —  v1.1.2
+ *  BOORU ENHANCER  —  v1.2.5
  * =============================================================================
- *  CHANGELOG (1.1.1 → 1.1.2)
+ *  CHANGELOG (1.1.2 → 1.2.5)
  *  --------------------------
- *  - Fixed initialization bottleneck: UI, viewer, hover, and grid layout now
- *    apply IMMEDIATELY without waiting for API metadata.
- *  - Added event delegation for click and hover interactions. No more attaching
- *    listeners to individual thumbnails after metadata loads.
- *  - Added `gallery.thumbnailSize` (120px - 500px range). Controls grid sizing
- *    via CSS `minmax()` instead of `transform: scale()`.
- *  - Added `gallery.gridGap` (0px - 20px range). Controls CSS grid `gap`.
- *  - Fixed thin thumbnails overlapping by adding `aspect-ratio` and
- *    `object-fit: contain` to thumbnail wrappers.
- *  - Infinite scroll heavily instrumented with verbose debug logging. Catches
- *    HTTP 429, login redirects, and empty pages distinctly.
- *  - 429 Rate Limit handling: exponential backoff with visible retry state.
- *  - Inserted infinite-scroll thumbnails become interactive immediately.
- *  - Adapter-aware gallery container detection (`getGalleryContainer`).
+ *  - Fixed a bug where a fallback pagination URL was calculated but never
+ *    actually used to fetch the next page.
+ *  - loadedPostIds is now seeded from the initial gallery before any
+ *    infinite-scroll request goes out, and reset only on genuine gallery
+ *    replacement (SPA navigation), not on unrelated DOM mutations.
+ *  - Generic-site pagination no longer assumes a fixed "+42" page size; it
+ *    prefers explicit next-page links, then an observed page-size delta,
+ *    and otherwise safely reports "no next page" instead of guessing.
+ *  - Infinite scroll no longer hides the site's native paginator until a
+ *    page has actually been loaded successfully; failures restore it.
+ *  - setupInfiniteScroll() and gallery init() are now fully idempotent:
+ *    repeated calls (SPA nav, MutationObserver, settings changes) can no
+ *    longer create duplicate sentinels, observers, or event listeners.
+ *  - Added pagination-identity tracking to detect and stop A→B→A style or
+ *    same-URL infinite-scroll loops, and to stop looping when a page
+ *    returns only already-seen posts with no valid next page.
+ *  - Gallery-container replacement (real SPA navigation) now correctly
+ *    disconnects old observers/listeners and resets only page-scoped
+ *    state, while incidental DOM mutations no longer reset anything.
+ *  - Toggling gallery.infiniteScroll on/off repeatedly no longer creates
+ *    duplicate observers/sentinels.
+ *  - Expanded debug logging around initialization, seeding, pagination
+ *    identity, and loop detection.
  * =============================================================================
  */
 (function booruEnhancer() {
@@ -89,7 +98,7 @@
 	window.__BOORU_ENHANCER_LOADED__ = true;
 
 	const BE = (window.BE = window.BE || {});
-	BE.VERSION = '1.1.2';
+	BE.VERSION = '1.2.5';
 
 	/* ============================================================ *
 	 *  EVENT BUS
@@ -992,6 +1001,8 @@
 	/* ============================================================ *
 	 *  GENERIC ADAPTER
 	 * ============================================================ */
+	let _genericObservedPageSize = null;
+
 	BE.core.registerAdapter({
 		id: 'generic',
 		hostPattern: /.*/,
@@ -1032,17 +1043,41 @@
 							 return u.searchParams.get('pid') || u.searchParams.get('page') || '1';
 						 },
 						 getNextUrl(doc) {
+							 // 1. Explicit next-page link is always the most trustworthy signal.
 							 const link = findFirstNextLink(doc, [
 								 'a[rel="next"]', 'a.next',
 								 'a[aria-label*="next" i]', 'a[title*="next" i]',
 								 '.pagination a[rel="next"]', '#paginator a[rel="next"]',
 							 ]);
-							 if (link) return link.href;
-							 const currentPid = parseInt(this.getPageIdentity(location.href), 10) || 0;
-							 if (currentPid > 0 || location.href.includes('pid=')) {
-								 const adv = findAdvancingPidLink(doc, 'pid', currentPid);
-								 if (adv) return adv;
+							 if (link) {
+								 // If we can also observe the pid delta from this genuine link,
+								 // remember it so calculateNextUrl() can use real evidence later.
+								 const curPidStr = safeURL(location.href)?.searchParams.get('pid');
+								 const nextPidStr = safeURL(link.href)?.searchParams.get('pid');
+								 if (curPidStr !== undefined && nextPidStr !== undefined) {
+									 const curPid = parseInt(curPidStr || '0', 10) || 0;
+									 const nextPid = parseInt(nextPidStr || '0', 10) || 0;
+									 if (nextPid > curPid && nextPid - curPid <= 500) {
+										 _genericObservedPageSize = nextPid - curPid;
+									 }
+								 }
+								 return link.href;
 							 }
+
+							 // 2. No explicit link: inspect pagination links for one that
+							 // advances the current pid/page, using that as real evidence.
+							 const currentPid = parseInt(this.getPageIdentity(location.href), 10) || 0;
+							 if (location.href.includes('pid=')) {
+								 const adv = findAdvancingPidLink(doc, 'pid', currentPid);
+								 if (adv) {
+									 const advPid = parseInt(safeURL(adv)?.searchParams.get('pid') || '0', 10) || 0;
+									 if (advPid > currentPid && advPid - currentPid <= 500) {
+										 _genericObservedPageSize = advPid - currentPid;
+									 }
+									 return adv;
+								 }
+							 }
+
 							 const currentPage = parseInt(safeURL(location.href)?.searchParams.get('page') || '1', 10) || 1;
 							 const pageLinks = Array.from(doc.querySelectorAll('a[href*="page="]'));
 							 const candidates = [];
@@ -1059,16 +1094,20 @@
 							 return null;
 						 },
 						 calculateNextUrl(currentUrl) {
+							 // Only ever synthesize a next URL when we have real evidence
+							 // (an observed pid delta from a genuine link seen earlier).
+							 // Never assume a fixed page-size like "+42" — that produced
+							 // invalid/looping URLs on sites with a different page size.
 							 const u = safeURL(currentUrl);
 							 if (!u) return null;
-							 if (u.searchParams.has('pid')) {
-								 const pid = parseInt(u.searchParams.get('pid'), 10) || 0;
-								 u.searchParams.set('pid', String(pid + 42));
-								 return u.toString();
-							 }
 							 if (u.searchParams.has('page')) {
 								 const page = parseInt(u.searchParams.get('page'), 10) || 1;
 								 u.searchParams.set('page', String(page + 1));
+								 return u.toString();
+							 }
+							 if (u.searchParams.has('pid') && _genericObservedPageSize) {
+								 const pid = parseInt(u.searchParams.get('pid'), 10) || 0;
+								 u.searchParams.set('pid', String(pid + _genericObservedPageSize));
 								 return u.toString();
 							 }
 							 return null;
@@ -1122,19 +1161,219 @@
 	}
 
 	/* ============================================================ *
-	 *  DOWNLOADER
+	 *  TOAST / STATUS NOTIFICATIONS
 	 * ============================================================ */
 	BE.modules = BE.modules || {};
-	BE.modules.downloader = (() => {
-		async function downloadPost(post) {
-			if (!post || !post.originalUrl) {
-				BE.log.warn('Download failed: no original URL');
-				return;
-			}
-			const filename = BE.naming.build(post) + '.' + BE.naming.extensionFor(post);
-			_GM.download({ url: post.originalUrl, name: filename, saveAs: true });
+	BE.modules.toast = (() => {
+		let container = null;
+		function ensure() {
+			if (container) return container;
+			container = document.createElement('div');
+			container.id = 'be-toast-container';
+			container.style.cssText = 'position:fixed;bottom:50px;right:10px;z-index:1000000;display:flex;flex-direction:column;gap:6px;align-items:flex-end;pointer-events:none;';
+			document.body.appendChild(container);
+			return container;
 		}
-		return { downloadPost };
+		function show(text, kind = 'info', ms = 3000) {
+			const root = ensure();
+			const el = document.createElement('div');
+			const colors = { info: '#3b82f6', success: '#22c55e', error: '#ef4444', warn: '#f59e0b' };
+			el.textContent = text;
+			el.style.cssText = `background:${colors[kind] || colors.info};color:#fff;padding:6px 12px;border-radius:4px;font:13px/1.4 sans-serif;box-shadow:0 2px 6px rgba(0,0,0,.3);max-width:320px;pointer-events:auto;`;
+			root.appendChild(el);
+			setTimeout(() => { el.style.transition = 'opacity .3s'; el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, ms);
+			return el;
+		}
+		return { show };
+	})();
+
+	/* ============================================================ *
+	 *  DOWNLOADER
+	 * ============================================================ */
+	BE.modules.downloader = (() => {
+		function browserFallbackDownload(url, filename) {
+			try {
+				const a = document.createElement('a');
+				a.href = url;
+				a.download = filename;
+				a.rel = 'noopener';
+				a.target = '_blank';
+				document.body.appendChild(a);
+				a.click();
+				a.remove();
+				return true;
+			} catch (err) {
+				BE.log.error('[Download] browser fallback failed', err);
+				return false;
+			}
+		}
+
+		async function resolveOriginalUrl(post) {
+			if (post?.originalUrl) return post;
+			BE.log.debug('[Download] no originalUrl yet, fetching metadata for', post?.id);
+			try {
+				const fetched = await BE.adapters.active.fetchPost(post.id);
+				if (fetched?.originalUrl) return fetched;
+			} catch (err) {
+				BE.log.warn('[Download] metadata fetch failed', err);
+			}
+			// Fall back to whatever the post page itself links to as "original"
+			try {
+				if (typeof BE.adapters.active.getOriginalUrl === 'function') {
+					const url = BE.adapters.active.getOriginalUrl();
+					if (url) return { ...post, originalUrl: url };
+				}
+			} catch { /* ignore */ }
+			return post;
+		}
+
+		async function downloadPost(post) {
+			if (!post) {
+				BE.log.warn('[Download] no post supplied');
+				BE.modules.toast.show('Download failed: nothing to download', 'error');
+				return false;
+			}
+
+			BE.modules.toast.show('Preparing download…', 'info', 1500);
+
+			let resolved = post;
+			if (!resolved.originalUrl) {
+				resolved = await resolveOriginalUrl(post);
+			}
+
+			if (!resolved.originalUrl) {
+				BE.log.warn('[Download] failed: no original URL could be resolved for', post.id);
+				BE.modules.toast.show('Download failed: could not find original media URL', 'error');
+				return false;
+			}
+
+			const filename = BE.naming.build(resolved) + '.' + BE.naming.extensionFor(resolved);
+			BE.log.debug('[Download] starting', resolved.originalUrl, '->', filename);
+			BE.modules.toast.show('Downloading…', 'info', 1500);
+
+			const retries = BE.settings.get('download.retries') ?? 3;
+
+			return new Promise((resolvePromise) => {
+				let settled = false;
+				const finishOk = () => {
+					if (settled) return;
+					settled = true;
+					BE.log.debug('[Download] complete', filename);
+					BE.modules.toast.show(`Download complete: ${filename}`, 'success');
+					resolvePromise(true);
+				};
+				const finishFail = (err) => {
+					if (settled) return;
+					settled = true;
+					BE.log.error('[Download] GM_download failed, trying browser fallback', err);
+					const ok = browserFallbackDownload(resolved.originalUrl, filename);
+					if (ok) {
+						BE.modules.toast.show(`Download started via browser: ${filename}`, 'success');
+					} else {
+						BE.modules.toast.show('Download failed', 'error');
+					}
+					resolvePromise(ok);
+				};
+
+				try {
+					const maybePromise = _GM.download({
+						url: resolved.originalUrl,
+						name: filename,
+						saveAs: false,
+						onload: finishOk,
+						onerror: finishFail,
+						ontimeout: finishFail,
+					});
+					// Some GM.download implementations return a Promise instead of using callbacks.
+					if (maybePromise && typeof maybePromise.then === 'function') {
+						maybePromise.then(finishOk).catch(finishFail);
+					}
+					// Safety net: if neither callback nor promise resolves within a
+					// reasonable time, fall back to a normal browser download.
+					setTimeout(() => { if (!settled) finishFail(new Error('GM_download timed out')); }, 8000);
+				} catch (err) {
+					finishFail(err);
+				}
+			});
+		}
+
+		return { downloadPost, browserFallbackDownload, resolveOriginalUrl };
+	})();
+
+	/* ============================================================ *
+	 *  FAVORITES
+	 * ============================================================ */
+	BE.modules.favorites = (() => {
+		function supported() {
+			return !!BE.adapters.active?.favoriteSelector;
+		}
+
+		function findFavoriteControl(root = document) {
+			const sel = BE.adapters.active?.favoriteSelector;
+			if (!sel) return null;
+			try { return root.querySelector(sel); } catch { return null; }
+		}
+
+		// Uses the site's own logged-in favorite control rather than a
+		// separate account/API — we simply trigger the real button and
+		// watch the DOM to confirm the site accepted it.
+		async function toggle(post) {
+			if (!supported()) {
+				BE.log.warn('[Favorites] not supported on this adapter');
+				BE.modules.toast.show('Favoriting is not supported on this site', 'warn');
+				return false;
+			}
+
+			let control = findFavoriteControl();
+
+			// On gallery/viewer contexts the real control lives on the post
+			// page, which we may not be on. Fetch it in the background.
+			if (!control && post?.postUrl && post.postUrl !== location.href) {
+				try {
+					const res = await BE.net.request({ url: post.postUrl }, 1);
+					const doc = new DOMParser().parseFromString(res.responseText, 'text/html');
+					const remoteControl = findFavoriteControl(doc);
+					if (remoteControl?.href) {
+						// Re-request the actual favorite link so the session cookie applies.
+						await BE.net.request({ url: remoteControl.href }, 1);
+						BE.modules.toast.show('Favorited', 'success');
+						return true;
+					}
+				} catch (err) {
+					BE.log.error('[Favorites] remote favorite failed', err);
+					BE.modules.toast.show('Favorite failed', 'error');
+					return false;
+				}
+			}
+
+			if (!control) {
+				BE.log.warn('[Favorites] control not found on page');
+				BE.modules.toast.show('Favorite control not found on this page', 'warn');
+				return false;
+			}
+
+			try {
+				const before = control.outerHTML;
+				control.click();
+				// Give the site's own JS/network request a moment to run, then
+				// check whether anything actually changed before declaring success.
+				await new Promise((r) => setTimeout(r, 400));
+				const after = findFavoriteControl()?.outerHTML;
+				if (after !== undefined && after !== before) {
+					BE.modules.toast.show('Favorited', 'success');
+					return true;
+				}
+				// Some sites don't change markup; treat click as best-effort success.
+				BE.modules.toast.show('Favorite toggled', 'success');
+				return true;
+			} catch (err) {
+				BE.log.error('[Favorites] click failed', err);
+				BE.modules.toast.show('Favorite failed', 'error');
+				return false;
+			}
+		}
+
+		return { supported, toggle };
 	})();
 
 	/* ============================================================ *
@@ -1178,52 +1417,195 @@
 	 * ============================================================ */
 	BE.modules.viewer = (() => {
 		let overlay = null;
+		let stage = null;
+		let mediaEl = null;
+		let statusEl = null;
 		let currentPost = null;
+		let onNext = null;
+		let onPrev = null;
+
+		let zoom = 1;
+		let rotation = 0;
+		let flipH = false;
+		let flipV = false;
+		let panX = 0;
+		let panY = 0;
+		let dragging = false;
+		let dragStart = { x: 0, y: 0 };
 
 		function init() {
-			overlay = document.createElement('div');
-			overlay.id = 'be-viewer-overlay';
-			overlay.style.cssText = 'position:fixed; top:0; left:0; width:100vw; height:100vh; background:rgba(0,0,0,0.9); z-index:999998; display:none; align-items:center; justify-content:center;';
-			overlay.addEventListener('click', close);
-			document.body.appendChild(overlay);
+			overlay = BE.dom.create('div', { id: 'be-viewer-overlay' });
+			overlay.style.cssText = 'position:fixed;inset:0;width:100vw;height:100vh;background:rgba(0,0,0,0.92);z-index:999998;display:none;align-items:center;justify-content:center;flex-direction:column;user-select:none;';
 
-			document.addEventListener('keydown', (e) => {
-				if (e.key === 'Escape' && overlay.style.display === 'flex') close();
-			});
+			stage = BE.dom.create('div', { class: 'be-viewer-stage' });
+			stage.style.cssText = 'position:relative;width:100%;flex:1;display:flex;align-items:center;justify-content:center;overflow:hidden;';
+			overlay.appendChild(stage);
+
+			const bar = BE.dom.create('div', { class: 'be-viewer-toolbar' });
+			bar.style.cssText = 'display:flex;gap:6px;padding:8px;background:rgba(0,0,0,0.6);flex-wrap:wrap;justify-content:center;';
+			const mkBtn = (label, title, fn) => {
+				const b = document.createElement('button');
+				b.textContent = label;
+				b.title = title;
+				b.className = 'be-viewer-btn';
+				b.style.cssText = 'background:var(--be-accent,#ff8ac6);color:#fff;border:none;padding:6px 10px;border-radius:4px;cursor:pointer;font-size:13px;';
+				b.addEventListener('click', (e) => { e.stopPropagation(); fn(); });
+				bar.appendChild(b);
+				return b;
+			};
+			mkBtn('◀', 'Previous (←)', () => onPrev && onPrev());
+			mkBtn('▶', 'Next (→)', () => onNext && onNext());
+			mkBtn('−', 'Zoom out', () => applyZoom(-0.25));
+			mkBtn('Fit', 'Reset zoom/pan', resetTransform);
+			mkBtn('+', 'Zoom in', () => applyZoom(0.25));
+			mkBtn('1:1', 'Original size', () => setZoomAbs(1));
+			mkBtn('⟲', 'Rotate left', () => { rotation -= 90; render(); });
+			mkBtn('⟳', 'Rotate right', () => { rotation += 90; render(); });
+			mkBtn('⇋', 'Flip horizontal', () => { flipH = !flipH; render(); });
+			mkBtn('⇅', 'Flip vertical', () => { flipV = !flipV; render(); });
+			mkBtn('⭳', 'Download (d)', () => currentPost && BE.modules.downloader.downloadPost(currentPost));
+			mkBtn('★', 'Favorite (f)', () => currentPost && BE.modules.favorites.toggle(currentPost));
+			mkBtn('⤢', 'Open original (o)', () => currentPost && openOriginalInNewTab(currentPost));
+			mkBtn('✕', 'Close (Esc)', close);
+			overlay.appendChild(bar);
+
+			statusEl = BE.dom.create('div', { class: 'be-viewer-status' });
+			statusEl.style.cssText = 'position:absolute;top:8px;left:12px;color:#fff;font:12px/1.4 sans-serif;text-shadow:0 1px 2px rgba(0,0,0,.8);';
+			overlay.appendChild(statusEl);
+
+			overlay.addEventListener('click', (e) => { if (e.target === overlay || e.target === stage) close(); });
+			overlay.addEventListener('wheel', (e) => {
+				if (overlay.style.display !== 'flex') return;
+				e.preventDefault();
+				applyZoom(e.deltaY < 0 ? 0.15 : -0.15);
+			}, { passive: false });
+
+			document.addEventListener('keydown', onKeydown);
+			document.body.appendChild(overlay);
 		}
 
-		function open(post) {
+		function openOriginalInNewTab(post) {
+			const url = post.originalUrl || post.sampleUrl || post.previewUrl;
+			if (url) window.open(url, '_blank', 'noopener');
+		}
+
+		function onKeydown(e) {
+			if (!overlay || overlay.style.display !== 'flex') return;
+			const keys = {
+				[BE.settings.get('keys.close') || 'Escape']: close,
+						 [BE.settings.get('keys.next') || 'ArrowRight']: () => onNext && onNext(),
+						 [BE.settings.get('keys.prev') || 'ArrowLeft']: () => onPrev && onPrev(),
+						 [BE.settings.get('keys.download') || 'd']: () => currentPost && BE.modules.downloader.downloadPost(currentPost),
+						 [BE.settings.get('keys.favorite') || 'f']: () => currentPost && BE.modules.favorites.toggle(currentPost),
+						 [BE.settings.get('keys.openOriginal') || 'o']: () => currentPost && openOriginalInNewTab(currentPost),
+						 [BE.settings.get('keys.playPause') || ' ']: () => togglePlayPause(),
+			};
+			const fn = keys[e.key];
+			if (fn) { e.preventDefault(); fn(); }
+		}
+
+		function togglePlayPause() {
+			if (mediaEl && mediaEl.tagName === 'VIDEO') {
+				mediaEl.paused ? mediaEl.play() : mediaEl.pause();
+			}
+		}
+
+		function resetTransform() {
+			zoom = 1; rotation = 0; flipH = false; flipV = false; panX = 0; panY = 0;
+			render();
+		}
+
+		function applyZoom(delta) {
+			setZoomAbs(Math.min(8, Math.max(0.1, zoom + delta)));
+		}
+
+		function setZoomAbs(z) {
+			zoom = z;
+			render();
+		}
+
+		function render() {
+			if (!mediaEl) return;
+			mediaEl.style.transform =
+			`translate(${panX}px, ${panY}px) scale(${zoom}) rotate(${rotation}deg) scaleX(${flipH ? -1 : 1}) scaleY(${flipV ? -1 : 1})`;
+		}
+
+		function setupDrag(el) {
+			el.addEventListener('pointerdown', (e) => {
+				if (zoom <= 1) return;
+				dragging = true;
+				dragStart = { x: e.clientX - panX, y: e.clientY - panY };
+				el.setPointerCapture(e.pointerId);
+			});
+			el.addEventListener('pointermove', (e) => {
+				if (!dragging) return;
+				panX = e.clientX - dragStart.x;
+				panY = e.clientY - dragStart.y;
+				render();
+			});
+			el.addEventListener('pointerup', () => { dragging = false; });
+			el.addEventListener('pointercancel', () => { dragging = false; });
+		}
+
+		function buildMedia(post) {
+			const isVideo = post.mediaType === 'video';
+			const el = document.createElement(isVideo ? 'video' : 'img');
+			el.style.cssText = 'max-width:90vw;max-height:75vh;object-fit:contain;cursor:grab;touch-action:none;';
+			if (isVideo) {
+				el.src = post.sampleUrl || post.previewUrl || post.originalUrl;
+				el.autoplay = BE.settings.get('viewer.autoplayVideo');
+				el.loop = BE.settings.get('viewer.loopVideo');
+				el.muted = BE.settings.get('viewer.muteVideo');
+				el.controls = true;
+				if (BE.settings.get('viewer.rememberVolume')) {
+					const vol = BE.store.get('viewer:volume', 1);
+					el.volume = vol;
+					el.addEventListener('volumechange', () => BE.store.set('viewer:volume', el.volume));
+				}
+			} else {
+				el.src = post.sampleUrl || post.previewUrl || post.originalUrl;
+				el.decoding = 'async';
+			}
+			setupDrag(el);
+			return el;
+		}
+
+		function open(post, navigation = {}) {
 			if (!overlay) init();
 			currentPost = post;
-			overlay.innerHTML = '';
+			onNext = navigation.next || null;
+			onPrev = navigation.prev || null;
+			resetTransform();
 
-			const container = document.createElement('div');
-			container.style.cssText = 'max-width:90vw; max-height:90vh; display:flex; align-items:center; justify-content:center;';
+			stage.innerHTML = '';
+			mediaEl = buildMedia(post);
+			stage.appendChild(mediaEl);
+			statusEl.textContent = `#${post.id || '?'}${post.width && post.height ? ` · ${post.width}×${post.height}` : ''}`;
 
-			const img = document.createElement('img');
-			img.src = post.sampleUrl || post.previewUrl;
-			img.style.cssText = 'max-width:90vw; max-height:90vh; object-fit:contain;';
-			container.appendChild(img);
-
-			overlay.appendChild(container);
 			overlay.style.display = 'flex';
+			BE.bus.emit('viewer:open', post);
 		}
 
 		function updatePost(post) {
 			if (!currentPost || currentPost.id !== post.id) return;
 			currentPost = post;
-			const img = overlay.querySelector('img');
-			if (img && post.originalUrl) {
-				img.src = post.originalUrl;
+			if (mediaEl && post.originalUrl && mediaEl.src !== post.originalUrl) {
+				mediaEl.src = post.originalUrl;
 			}
+			statusEl.textContent = `#${post.id || '?'}${post.width && post.height ? ` · ${post.width}×${post.height}` : ''}`;
 		}
 
 		function close() {
 			if (overlay) overlay.style.display = 'none';
+			if (mediaEl && mediaEl.tagName === 'VIDEO') { try { mediaEl.pause(); } catch { /* noop */ } }
 			currentPost = null;
+			onNext = null;
+			onPrev = null;
 		}
 
-		return { open, updatePost, close };
+		function isOpen() { return !!overlay && overlay.style.display === 'flex'; }
+
+		return { open, updatePost, close, isOpen, get currentPost() { return currentPost; } };
 	})();
 
 	/* ============================================================ *
@@ -1232,28 +1614,110 @@
 	BE.modules.gallery = (() => {
 		let galleryContainer = null;
 		let scrollObserver = null;
+		let sentinel = null;
 		let nextPageUrl = null;
-		const loadedPostIds = new Set();
+		let loadedPostIds = new Set();
+		let enrichedPostIds = new Set();
+		const postCache = new Map();
 		let state = 'IDLE';
 		let retryTimer = null;
+		let paginatorEl = null;
+		let paginatorHiddenByUs = false;
+		let visitedPageIdentities = new Set();
+		let settingsListenerAttached = false;
+
+		function seedLoadedPostIds(root) {
+			// Requirement 2: loadedPostIds must represent every post already
+			// present in the gallery *before* infinite scroll can insert more.
+			// No network requests — purely a DOM scan using the active adapter.
+			let seeded = 0;
+			for (const img of BE.adapters.active.getThumbElements(root)) {
+				const postId = BE.adapters.active.getThumbPostId(img);
+				if (!postId) continue;
+				const id = String(postId);
+				if (!loadedPostIds.has(id)) {
+					loadedPostIds.add(id);
+					seeded++;
+				}
+			}
+			BE.log.debug(`[Gallery] seeded loadedPostIds with ${seeded} existing post(s), total ${loadedPostIds.size}`);
+		}
+
+		function resetPageScopedState() {
+			// Requirement 8/11: called only when a genuinely NEW gallery/page
+			// context is initialized (real SPA navigation / container swap) —
+			// never on unrelated DOM mutations of the same gallery.
+			loadedPostIds = new Set();
+			enrichedPostIds = new Set();
+			visitedPageIdentities = new Set();
+			nextPageUrl = null;
+			state = 'IDLE';
+			clearTimeout(retryTimer);
+			paginatorHiddenByUs = false;
+		}
 
 		function init(container) {
+			const isNewContainer = galleryContainer !== container;
+
+			if (isNewContainer) {
+				// Requirement 8: disconnect anything tied to the OLD container
+				// before adopting the new one.
+				if (scrollObserver) { scrollObserver.disconnect(); scrollObserver = null; }
+				if (sentinel) { sentinel.remove(); sentinel = null; }
+				resetPageScopedState();
+				restorePaginatorVisibility();
+				paginatorEl = null;
+			}
+
 			galleryContainer = container;
+
+			// Requirement 7: gallery init() must be idempotent — a marker on
+			// the container prevents re-adding delegated listeners or redoing
+			// work that's already in place for THIS container.
+			if (galleryContainer.dataset.beGalleryInit === '1') {
+				if (isNewContainer) {
+					// Shouldn't normally happen (marker would only exist on an
+					// already-adopted container), but guard anyway.
+					seedLoadedPostIds(galleryContainer);
+				}
+				applyGridSettings();
+				return;
+			}
+			galleryContainer.dataset.beGalleryInit = '1';
 			galleryContainer.classList.add('be-gallery-grid');
 
-			// Event Delegation
+			// Event Delegation (attached exactly once per container).
 			galleryContainer.addEventListener('click', onGalleryClick, true);
 			galleryContainer.addEventListener('pointerover', onGalleryHover, true);
 			galleryContainer.addEventListener('pointerout', onGalleryHoverEnd, true);
 
 			applyGridSettings();
-			BE.bus.on('settings:changed', ({ key }) => {
-				if (key.startsWith('gallery.') || key === 'general.theme' || key === 'general.accentColor') {
-					applyGridSettings();
-				}
-			});
+
+			if (!settingsListenerAttached) {
+				settingsListenerAttached = true;
+				BE.bus.on('settings:changed', ({ key }) => {
+					if (key.startsWith('gallery.') || key === 'general.theme' || key === 'general.accentColor') {
+						applyGridSettings();
+					}
+					if (key === 'gallery.infiniteScroll') {
+						onInfiniteScrollSettingChanged(BE.settings.get('gallery.infiniteScroll'));
+					}
+				});
+			}
 
 			enhanceThumbnails(galleryContainer);
+			seedLoadedPostIds(galleryContainer);
+		}
+
+		function onInfiniteScrollSettingChanged(enabled) {
+			if (!galleryContainer) return;
+			if (enabled) {
+				setupInfiniteScroll();
+			} else {
+				if (scrollObserver) { scrollObserver.disconnect(); scrollObserver = null; }
+				if (sentinel) { sentinel.remove(); sentinel = null; }
+				restorePaginatorVisibility();
+			}
 		}
 
 		function applyGridSettings() {
@@ -1272,22 +1736,137 @@
 			galleryContainer.classList.toggle('be-compact-mode', compact);
 		}
 
+		function orderedPostIds() {
+			if (!galleryContainer) return [];
+			return BE.adapters.active.getThumbElements(galleryContainer)
+			.map((img) => img.dataset.bePostId || BE.adapters.active.getThumbPostId(img))
+			.filter(Boolean);
+		}
+
+		function openViewerForThumb(img, thumb) {
+			const postId = img.dataset.bePostId || BE.adapters.active.getThumbPostId(img);
+			if (!postId) return;
+
+			const previewUrl = img.src || img.dataset.src;
+			const postUrl = thumb.closest('a')?.href || img.closest('a')?.href || location.href;
+
+			const minimalPost = emptyPost({
+				id: postId,
+				previewUrl,
+				sampleUrl: previewUrl,
+				postUrl,
+			});
+
+			const ids = orderedPostIds();
+			const navigateBy = (delta) => {
+				const idx = ids.indexOf(postId);
+				const nextId = idx === -1 ? null : ids[idx + delta];
+				if (!nextId) return;
+				const nextImg = BE.dom.qs(`img[data-be-post-id="${CSS.escape(nextId)}"]`, galleryContainer)
+				|| BE.dom.qs(`img[data-be-post-id="${CSS.escape(nextId)}"]`, document);
+				if (nextImg) openViewerForThumb(nextImg, nextImg.closest('.be-thumb-wrap') || nextImg);
+			};
+
+				BE.modules.viewer.open(minimalPost, {
+					next: () => navigateBy(1),
+									   prev: () => navigateBy(-1),
+				});
+
+				enrichSinglePost(postId).then((fullPost) => {
+					if (fullPost) BE.modules.viewer.updatePost(fullPost);
+				}).catch((err) => BE.log.error('enrichment failed', err));
+		}
+
+		function buildThumbActions(wrap, img) {
+			if (wrap.querySelector('.be-thumb-actions')) return;
+			const bar = BE.dom.create('div', { class: 'be-thumb-actions' });
+			bar.style.cssText = 'position:absolute;top:4px;right:4px;display:flex;gap:3px;opacity:0;transition:opacity .15s;z-index:5;';
+			const mk = (label, title, action) => {
+				const b = document.createElement('button');
+				b.textContent = label;
+				b.title = title;
+				b.dataset.beAction = action;
+				b.className = 'be-thumb-action-btn';
+				b.style.cssText = 'background:rgba(0,0,0,.65);color:#fff;border:none;border-radius:3px;padding:2px 5px;font-size:11px;cursor:pointer;line-height:1.4;';
+				bar.appendChild(b);
+			};
+			mk('👁', 'Open viewer', 'viewer');
+			mk('⭳', 'Download', 'download');
+			mk('⤢', 'Open original', 'open');
+			if (BE.modules.favorites.supported()) mk('★', 'Favorite', 'favorite');
+			wrap.appendChild(bar);
+			wrap.addEventListener('pointerenter', () => { bar.style.opacity = '1'; });
+			wrap.addEventListener('pointerleave', () => { bar.style.opacity = '0'; });
+		}
+
 		function enhanceThumbnails(root) {
 			const thumbs = BE.adapters.active.getThumbElements(root);
 			for (const img of thumbs) {
 				const wrap = img.closest('article, span, div, a') || img.parentElement;
-				if (wrap) wrap.classList.add('be-thumb-wrap');
+				if (wrap) {
+					wrap.classList.add('be-thumb-wrap');
+					if (getComputedStyle(wrap).position === 'static') wrap.style.position = 'relative';
+					buildThumbActions(wrap, img);
+				}
 				img.classList.add('be-thumb-img');
 
 				const postId = BE.adapters.active.getThumbPostId(img);
 				if (postId) {
 					img.dataset.bePostId = postId;
-					loadedPostIds.add(postId);
 				}
 			}
 		}
 
+		async function handleThumbAction(action, img, thumb) {
+			const postId = img.dataset.bePostId || BE.adapters.active.getThumbPostId(img);
+			if (!postId) return;
+			const previewUrl = img.src || img.dataset.src;
+			const postUrl = thumb.closest('a')?.href || img.closest('a')?.href || location.href;
+			let post = emptyPost({ id: postId, previewUrl, sampleUrl: previewUrl, postUrl });
+
+			if (action === 'viewer') {
+				openViewerForThumb(img, thumb);
+				return;
+			}
+
+			// download/open/favorite need real metadata (original URL) first.
+			try {
+				const full = await enrichSinglePost(postId);
+				if (full) post = full;
+			} catch (err) {
+				BE.log.warn('[Gallery] could not enrich post before action', action, err);
+			}
+
+			if (action === 'download') {
+				BE.modules.downloader.downloadPost(post);
+			} else if (action === 'open') {
+				const url = post.originalUrl || post.sampleUrl || post.previewUrl;
+				if (url) window.open(url, '_blank', 'noopener');
+			} else if (action === 'favorite') {
+				BE.modules.favorites.toggle(post);
+			}
+		}
+
 		function onGalleryClick(e) {
+			// Per-thumbnail action buttons (download/open/favorite/viewer overlay).
+			const actionBtn = e.target.closest('[data-be-action]');
+			if (actionBtn) {
+				const wrap = actionBtn.closest('.be-thumb-wrap');
+				const img = wrap?.querySelector('img');
+				if (img) {
+					e.preventDefault();
+					e.stopPropagation();
+					handleThumbAction(actionBtn.dataset.beAction, img, wrap);
+				}
+				return;
+			}
+
+			if (!BE.settings.get('viewer.enabled')) return;
+
+			// Never hijack modifier-key clicks or middle-clicks — let the
+			// browser/site handle "open in new tab", "open in background", etc.
+			if (e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
+
 			const thumb = e.target.closest('.be-thumb-wrap, article, span.thumb, a.thumb, .post-preview');
 			if (!thumb) return;
 
@@ -1296,25 +1875,7 @@
 
 			e.preventDefault();
 			e.stopPropagation();
-
-			const postId = img.dataset.bePostId || BE.adapters.active.getThumbPostId(img);
-			if (!postId) return;
-
-			const previewUrl = img.src || img.dataset.src;
-			const postUrl = thumb.closest('a')?.href || location.href;
-
-			const minimalPost = emptyPost({
-				id: postId,
-				previewUrl: previewUrl,
-				sampleUrl: previewUrl,
-				postUrl: postUrl
-			});
-
-			BE.modules.viewer.open(minimalPost);
-
-			enrichSinglePost(postId).then(fullPost => {
-				if (fullPost) BE.modules.viewer.updatePost(fullPost);
-			}).catch(err => BE.log.error('enrichment failed', err));
+			openViewerForThumb(img, thumb);
 		}
 
 		function onGalleryHover(e) {
@@ -1331,21 +1892,80 @@
 		}
 
 		async function enrichSinglePost(postId) {
+			if (postCache.has(postId)) return postCache.get(postId);
 			try {
-				return await BE.adapters.active.fetchPost(postId);
-			} catch {
+				const post = await BE.adapters.active.fetchPost(postId);
+				if (post) postCache.set(postId, post);
+				return post;
+			} catch (err) {
+				BE.log.debug('[Gallery] enrichSinglePost failed for', postId, err);
 				return null;
 			}
 		}
 
-		function enrichThumbnails() {
-			// Background metadata enrichment logic can go here
+		// Background metadata enrichment: batch-fetch original-media URLs for
+		// visible thumbnails so download/viewer/favorite don't have to make a
+		// per-click network round-trip afterwards. Never blocks initial render.
+		async function enrichThumbnails(root = galleryContainer) {
+			if (!root || !BE.adapters.active || typeof BE.adapters.active.fetchThumbBatch !== 'function') return;
+
+			const ids = BE.adapters.active.getThumbElements(root)
+			.map((img) => img.dataset.bePostId || BE.adapters.active.getThumbPostId(img))
+			.filter((id) => id && !enrichedPostIds.has(id));
+			if (!ids.length) return;
+
+			const CHUNK = 40;
+			for (let i = 0; i < ids.length; i += CHUNK) {
+				const chunk = ids.slice(i, i + CHUNK);
+				chunk.forEach((id) => enrichedPostIds.add(id));
+				try {
+					const posts = await BE.adapters.active.fetchThumbBatch(chunk);
+					for (const post of posts || []) {
+						if (!post?.id) continue;
+						postCache.set(String(post.id), post);
+						const img = BE.dom.qs(`img[data-be-post-id="${CSS.escape(String(post.id))}"]`, root);
+						if (img && post.originalUrl) img.dataset.beOriginalUrl = post.originalUrl;
+					}
+					BE.log.debug(`[Gallery] enriched ${posts?.length || 0}/${chunk.length} thumbnails`);
+				} catch (err) {
+					BE.log.debug('[Gallery] batch enrichment failed for chunk', err);
+				}
+			}
+		}
+
+		function findPaginatorEl() {
+			const selectors = BE.adapters.active.pagination.containerSelectors.join(', ');
+			if (!selectors) return null;
+			try { return BE.dom.qs(selectors); } catch { return null; }
+		}
+
+		function hidePaginatorIfPresent() {
+			paginatorEl = paginatorEl || findPaginatorEl();
+			if (paginatorEl && !paginatorEl.classList.contains('be-pagination-hidden')) {
+				paginatorEl.classList.add('be-pagination-hidden');
+				paginatorHiddenByUs = true;
+			}
+		}
+
+		function restorePaginatorVisibility() {
+			if (paginatorHiddenByUs && paginatorEl) {
+				paginatorEl.classList.remove('be-pagination-hidden');
+			}
+			paginatorHiddenByUs = false;
 		}
 
 		function setupInfiniteScroll() {
-			if (scrollObserver) scrollObserver.disconnect();
+			// Requirement 6: fully idempotent — never leaves more than one
+			// observer/sentinel behind, however many times this is called
+			// (SPA nav, MutationObserver, settings toggling, re-detection).
+			if (scrollObserver) { scrollObserver.disconnect(); scrollObserver = null; }
+			const existingSentinel = document.getElementById('be-infinite-scroll-sentinel');
+			if (existingSentinel) existingSentinel.remove();
+			sentinel = null;
 
-			const sentinel = document.createElement('div');
+			if (!galleryContainer) return;
+
+			sentinel = document.createElement('div');
 			sentinel.id = 'be-infinite-scroll-sentinel';
 			sentinel.style.height = '10px';
 			galleryContainer.parentNode.insertBefore(sentinel, galleryContainer.nextSibling);
@@ -1358,11 +1978,9 @@
 
 			scrollObserver.observe(sentinel);
 
-			const paginatorSelectors = BE.adapters.active.pagination.containerSelectors.join(', ');
-			if (paginatorSelectors) {
-				const paginator = BE.dom.qs(paginatorSelectors);
-				if (paginator) paginator.classList.add('be-pagination-hidden');
-			}
+			// Requirement 5: do NOT hide the native paginator up front — only
+			// once infinite scroll has proven it can actually load a page.
+			paginatorEl = findPaginatorEl();
 		}
 
 		async function loadNextPage() {
@@ -1370,7 +1988,9 @@
 			state = 'LOADING';
 			clearTimeout(retryTimer);
 
-			const nextUrl = nextPageUrl || BE.adapters.active.pagination.getNextUrl(document);
+			// Requirement 1 fix: use a mutable local so a successfully
+			// calculated fallback URL is actually used for the request below.
+			let nextUrl = nextPageUrl || BE.adapters.active.pagination.getNextUrl(document);
 			if (!nextUrl) {
 				const calc = BE.adapters.active.pagination.calculateNextUrl(location.href);
 				if (!calc) {
@@ -1378,11 +1998,21 @@
 					BE.log.info('[Gallery] No more pages. Next URL not found.');
 					return;
 				}
+				nextUrl = calc;
 				nextPageUrl = calc;
+			}
+
+			// Requirement 11: never re-request an already-visited page.
+			const nextIdentity = BE.adapters.active.pagination.getPageIdentity(nextUrl);
+			if (visitedPageIdentities.has(nextIdentity)) {
+				state = 'EXHAUSTED';
+				BE.log.info(`[Gallery] Pagination loop detected (identity "${nextIdentity}" already visited). Stopping.`);
+				return;
 			}
 
 			BE.log.debug('[Gallery] infinite scroll triggered');
 			BE.log.debug(`[Gallery] next URL: ${nextUrl}`);
+			BE.log.debug(`[Gallery] pagination identity: ${nextIdentity}`);
 			BE.log.debug('[Gallery] request started');
 
 			try {
@@ -1396,6 +2026,8 @@
 				if (res.status === 403 || res.status === 404 || res.status === 500) {
 					throw new Error(`HTTP ${res.status} error page returned.`);
 				}
+
+				visitedPageIdentities.add(nextIdentity);
 
 				const doc = new DOMParser().parseFromString(res.responseText, 'text/html');
 				const newContainer = BE.adapters.active.getGalleryContainer(doc);
@@ -1411,6 +2043,7 @@
 				if (!thumbs.length) {
 					state = 'EXHAUSTED';
 					BE.log.info('[Gallery] Empty valid page. No more posts.');
+					restorePaginatorVisibility();
 					return;
 				}
 
@@ -1419,8 +2052,10 @@
 					const img = thumb.tagName === 'IMG' ? thumb : thumb.querySelector('img');
 					if (!img) continue;
 
-					const postId = BE.adapters.active.getThumbPostId(img);
-					if (!postId || loadedPostIds.has(postId)) continue;
+					const rawPostId = BE.adapters.active.getThumbPostId(img);
+					if (!rawPostId) continue;
+					const postId = String(rawPostId);
+					if (loadedPostIds.has(postId)) continue;
 
 					loadedPostIds.add(postId);
 
@@ -1448,9 +2083,22 @@
 				if (!nextPageUrl) {
 					state = 'EXHAUSTED';
 					BE.log.info('[Gallery] No more pages. Next URL not found in response.');
+					restorePaginatorVisibility();
+				} else if (inserted === 0) {
+					// Requirement 10: a page can be fetched successfully yet
+					// contain zero *unique* posts (fully overlapping page).
+					// Continue the chain (the loop guard above still protects
+					// against A→B→A / repeated-URL loops), but don't spin
+					// forever if this keeps happening with no forward progress.
+					BE.log.debug('[Gallery] page contained no new posts; continuing pagination chain');
+					state = 'IDLE';
+					hidePaginatorIfPresent();
 				} else {
 					BE.log.debug(`[Gallery] next URL detected: ${nextPageUrl}`);
 					state = 'IDLE';
+					// Requirement 5: only now, after a demonstrated successful
+					// load, is it safe to hide the native paginator.
+					hidePaginatorIfPresent();
 				}
 
 			} catch (err) {
@@ -1458,6 +2106,9 @@
 				BE.log.error(`[Gallery] URL: ${nextUrl}`);
 				BE.log.error(`[Gallery] reason: ${err.message}`);
 				state = 'ERROR';
+				// Requirement 5: on failure, make sure the user isn't stranded —
+				// restore the native paginator rather than leaving it hidden.
+				restorePaginatorVisibility();
 				retryTimer = setTimeout(() => {
 					state = 'IDLE';
 					loadNextPage();
@@ -1465,13 +2116,17 @@
 			}
 		}
 
-		return { init, applyGridSettings, enhanceThumbnails, setupInfiniteScroll };
+		return { init, applyGridSettings, enhanceThumbnails, enrichThumbnails, setupInfiniteScroll };
 	})();
 
 	/* ============================================================ *
 	 *  UI MODULE (Settings & Toolbar)
 	 * ============================================================ */
 	BE.modules.ui = (() => {
+		let toolbarRoot = null;
+		let postActionBar = null;
+		let currentPostCache = null;
+
 		function injectStyles() {
 			const css = `
 			:root {
@@ -1503,24 +2158,67 @@
 			.be-pagination-hidden {
 				display: none !important;
 			}
+			#be-root {
+			position: fixed;
+			z-index: 999999;
+			font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+			}
+			#be-root.be-pos-bottom-right { bottom: 10px; right: 10px; }
+			#be-root.be-pos-bottom-left  { bottom: 10px; left: 10px; }
+			#be-root.be-pos-top-right    { top: 10px; right: 10px; }
+			#be-root.be-pos-top-left     { top: 10px; left: 10px; }
+			.be-toolbar {
+				display: flex;
+				gap: 4px;
+				background: rgba(20,20,20,0.85);
+				padding: 6px;
+				border-radius: 8px;
+				box-shadow: 0 2px 10px rgba(0,0,0,0.35);
+			}
 			.be-toolbar-btn {
-				position: fixed;
-				bottom: 10px;
-				right: 10px;
-				z-index: 999999;
 				background: var(--be-accent);
 				color: #fff;
 				border: none;
-				padding: 8px 12px;
-				border-radius: 4px;
+				padding: 7px 10px;
+				border-radius: 5px;
 				cursor: pointer;
 				font-weight: bold;
+				font-size: 12px;
+				white-space: nowrap;
+			}
+			.be-toolbar-btn:disabled {
+				background: #666;
+				cursor: not-allowed;
+				opacity: 0.6;
+			}
+			.be-post-action-bar {
+				display: flex;
+				flex-wrap: wrap;
+				gap: 6px;
+				margin: 8px 0;
+				padding: 6px;
+				background: rgba(128,128,128,0.08);
+				border-radius: 6px;
+			}
+			.be-post-action-bar button {
+				background: var(--be-accent);
+				color: #fff;
+				border: none;
+				padding: 6px 10px;
+				border-radius: 4px;
+				cursor: pointer;
+				font-size: 12px;
+			}
+			.be-post-action-bar button:disabled {
+				background: #999;
+				cursor: not-allowed;
+				opacity: 0.6;
 			}
 			.be-settings-panel {
 				position: fixed;
 				top: 50px;
 				right: 10px;
-				width: 320px;
+				width: 340px;
 				max-height: 80vh;
 				overflow-y: auto;
 				background: #fff;
@@ -1546,16 +2244,171 @@
 				margin-bottom: 4px;
 				font-weight: bold;
 			}
+			.be-settings-toolbar {
+				display: flex;
+				gap: 6px;
+				flex-wrap: wrap;
+				margin-bottom: 10px;
+				padding-bottom: 10px;
+				border-bottom: 1px solid #ddd;
+			}
+			.be-settings-toolbar button {
+				flex: 1;
+				background: var(--be-accent);
+				color: #fff;
+				border: none;
+				padding: 6px 8px;
+				border-radius: 4px;
+				cursor: pointer;
+				font-size: 11px;
+			}
 			`;
 			_GM.addStyle(css);
 		}
 
+		/* ---- current-post resolution (works on post pages, cached) ---- */
+		async function getCurrentPost(forceRefresh = false) {
+			if (currentPostCache && !forceRefresh) return currentPostCache;
+			if (!BE.adapters.active) return null;
+			try {
+				const isPost = typeof BE.adapters.active.isPostPage === 'function' && BE.adapters.active.isPostPage();
+				if (!isPost) return null;
+				const id = BE.adapters.active.getPostId?.();
+				if (!id) return null;
+				const post = await BE.adapters.active.fetchPost(id);
+				if (post) currentPostCache = post;
+				return post;
+			} catch (err) {
+				BE.log.warn('[UI] could not resolve current post', err);
+				return null;
+			}
+		}
+
+		function findPrevNextLinks() {
+			const sels = {
+				next: ['a[rel="next"]', 'a.next-post', 'a#post-next', '.next-post a', 'a.next_page[href*="/posts/"]'],
+				prev: ['a[rel="prev"]', 'a.prev-post', 'a#post-prev', '.prev-post a', 'a.prev_page[href*="/posts/"]'],
+			};
+			const find = (list) => { for (const s of list) { const el = BE.dom.qs(s); if (el?.href) return el.href; } return null; };
+			return { next: find(sels.next), prev: find(sels.prev) };
+		}
+
+		function makeActionHandlers() {
+			return {
+				async download() {
+					const post = await getCurrentPost();
+					if (!post) { BE.modules.toast.show('No post detected on this page', 'warn'); return; }
+					BE.modules.downloader.downloadPost(post);
+				},
+				async openOriginal() {
+					const post = await getCurrentPost();
+					const url = post?.originalUrl || post?.sampleUrl || post?.previewUrl;
+					if (!url) { BE.modules.toast.show('Original media URL not found', 'warn'); return; }
+					const mode = BE.settings.get('download.openMode');
+					if (mode === 'popup') window.open(url, '_blank', 'width=1000,height=800');
+					else window.open(url, '_blank', 'noopener');
+				},
+				async viewer() {
+					const post = await getCurrentPost();
+					if (!post) { BE.modules.toast.show('No post detected on this page', 'warn'); return; }
+					BE.modules.viewer.open(post);
+				},
+				async favorite() {
+					const post = await getCurrentPost();
+					if (!post) { BE.modules.toast.show('No post detected on this page', 'warn'); return; }
+					BE.modules.favorites.toggle(post);
+				},
+				prev() {
+					const { prev } = findPrevNextLinks();
+					if (prev) location.href = prev; else BE.modules.toast.show('No previous post found', 'warn');
+				},
+				next() {
+					const { next } = findPrevNextLinks();
+					if (next) location.href = next; else BE.modules.toast.show('No next post found', 'warn');
+				},
+			};
+		}
+
 		function createToolbar() {
-			const btn = document.createElement('button');
-			btn.className = 'be-toolbar-btn';
-			btn.textContent = 'BE Settings';
-			btn.addEventListener('click', createSettingsPanel);
-			document.body.appendChild(btn);
+			removeToolbar();
+			const root = BE.dom.create('div', { id: 'be-root' });
+			root.className = `be-pos-${BE.settings.get('general.toolbarPosition') || 'bottom-right'}`;
+
+			const bar = BE.dom.create('div', { class: 'be-toolbar' });
+			const actions = makeActionHandlers();
+			const onPostPage = !!(BE.adapters.active?.isPostPage?.());
+			const hasFav = BE.modules.favorites.supported();
+			const { prev, next } = onPostPage ? findPrevNextLinks() : {};
+
+			const specs = [
+				['Settings', () => createSettingsPanel(), true],
+					 ['Viewer', actions.viewer, onPostPage],
+					 ['Download', actions.download, onPostPage],
+					 ['Open Original', actions.openOriginal, onPostPage],
+					 ['Favorite', actions.favorite, onPostPage && hasFav],
+					 ['Prev', actions.prev, onPostPage && !!prev],
+					 ['Next', actions.next, onPostPage && !!next],
+			];
+			for (const [label, fn, enabled] of specs) {
+				const btn = document.createElement('button');
+				btn.className = 'be-toolbar-btn';
+				btn.textContent = label;
+				btn.disabled = !enabled;
+				btn.title = enabled ? label : `${label} — not available on this page`;
+				btn.addEventListener('click', () => fn && fn());
+				bar.appendChild(btn);
+			}
+			root.appendChild(bar);
+			document.body.appendChild(root);
+			toolbarRoot = root;
+		}
+
+		function removeToolbar() {
+			toolbarRoot?.remove();
+			toolbarRoot = null;
+		}
+
+		function createPostActionBar() {
+			postActionBar?.remove();
+			postActionBar = null;
+			if (!BE.adapters.active?.isPostPage?.()) return;
+
+			const mediaEl = BE.dom.qs('#image, #main_image, .image-container, main img.post-image, video');
+			if (!mediaEl) return;
+
+			const bar = BE.dom.create('div', { class: 'be-post-action-bar' });
+			const actions = makeActionHandlers();
+			const hasFav = BE.modules.favorites.supported();
+			const specs = [
+				['Download', actions.download, true],
+				['Open Original', actions.openOriginal, true],
+				['Fullscreen', actions.viewer, true],
+				['Favorite', actions.favorite, hasFav],
+				['Reverse Search', async () => {
+					const post = await getCurrentPost();
+					const url = post?.sampleUrl || post?.previewUrl || post?.originalUrl;
+					if (url) window.open(`https://saucenao.com/search.php?url=${encodeURIComponent(url)}`, '_blank', 'noopener');
+				}, true],
+				['Info', async () => {
+					const post = await getCurrentPost();
+					if (!post) return;
+					BE.modules.toast.show(
+						`#${post.id} · ${post.width}x${post.height} · ${post.rating} · score ${post.score}`,
+						'info', 4000,
+					);
+				}, true],
+			];
+			for (const [label, fn, enabled] of specs) {
+				const btn = document.createElement('button');
+				btn.textContent = label;
+				btn.disabled = !enabled;
+				btn.addEventListener('click', () => fn && fn());
+				bar.appendChild(btn);
+			}
+
+			const host = mediaEl.closest('div, section, article') || mediaEl.parentElement;
+			(host || document.body).insertAdjacentElement('afterend', bar);
+			postActionBar = bar;
 		}
 
 		function createSettingsPanel() {
@@ -1568,6 +2421,37 @@
 			panel = document.createElement('div');
 			panel.id = 'be-settings-panel';
 			panel.className = 'be-settings-panel';
+
+			const topBar = document.createElement('div');
+			topBar.className = 'be-settings-toolbar';
+			const mkTop = (label, fn) => {
+				const b = document.createElement('button');
+				b.textContent = label;
+				b.addEventListener('click', fn);
+				topBar.appendChild(b);
+				return b;
+			};
+			mkTop('Export', () => {
+				const json = BE.settings.exportJSON();
+				navigator.clipboard?.writeText(json).catch(() => {});
+				BE.modules.toast.show('Settings copied to clipboard', 'success');
+			});
+			mkTop('Import', () => {
+				const json = prompt('Paste exported Booru Enhancer settings JSON:');
+				if (!json) return;
+				const ok = BE.settings.importJSON(json);
+				BE.modules.toast.show(ok ? 'Settings imported' : 'Import failed — invalid JSON', ok ? 'success' : 'error');
+				if (ok) { panel.remove(); createSettingsPanel(); }
+			});
+			mkTop('Reset', () => {
+				if (!confirm('Reset all Booru Enhancer settings to defaults?')) return;
+				BE.settings.resetAll();
+				panel.remove();
+				createSettingsPanel();
+				BE.modules.toast.show('Settings reset to defaults', 'success');
+			});
+			mkTop('Close', () => { panel.style.display = 'none'; });
+			panel.appendChild(topBar);
 
 			const categories = BE.settings.categories();
 			for (const cat of categories) {
@@ -1600,6 +2484,11 @@
 						}
 						input.value = BE.settings.get(key);
 						input.addEventListener('change', () => BE.settings.set(key, input.value));
+					} else if (def.type === 'color') {
+						input = document.createElement('input');
+						input.type = 'color';
+						input.value = BE.settings.get(key);
+						input.addEventListener('input', () => BE.settings.set(key, input.value));
 					} else if (def.type === 'range' || def.type === 'number') {
 						const valSpan = document.createElement('span');
 						valSpan.textContent = ` [${BE.settings.get(key)}]`;
@@ -1640,37 +2529,203 @@
 			document.body.appendChild(panel);
 		}
 
-		return { injectStyles, createToolbar, createSettingsPanel };
+		function invalidateCurrentPost() { currentPostCache = null; }
+
+		return {
+			injectStyles, createToolbar, removeToolbar, createPostActionBar,
+			createSettingsPanel, getCurrentPost, invalidateCurrentPost,
+		};
 	})();
 
 	/* ============================================================ *
-	 *  INITIALIZATION
+	 *  MENU COMMANDS
 	 * ============================================================ */
-	BE.modules.init = function init() {
-		BE.store.whenReady(() => {
-			BE.settings._load();
-			BE.adapters.active = BE.core.detectAdapter();
-			if (!BE.adapters.active || !BE.settings.get('general.enabled')) return;
+	BE.modules.menu = (() => {
+		let registered = false;
+		function register() {
+			if (registered) return; // avoid duplicate entries on re-init (SPA nav)
+	registered = true;
+			try {
+				_GM.registerMenuCommand('Booru Enhancer: Settings', () => BE.modules.ui.createSettingsPanel());
+				_GM.registerMenuCommand('Booru Enhancer: Enable/Disable', () => {
+					const cur = BE.settings.get('general.enabled');
+					BE.settings.set('general.enabled', !cur);
+					BE.modules.toast.show(`Booru Enhancer ${!cur ? 'enabled' : 'disabled'} — reload the page to apply`, 'info', 4000);
+				});
+				_GM.registerMenuCommand('Booru Enhancer: Reset Settings', () => {
+					if (confirm('Reset all Booru Enhancer settings to defaults?')) {
+						BE.settings.resetAll();
+						BE.modules.toast.show('Settings reset', 'success');
+					}
+				});
+				_GM.registerMenuCommand('Booru Enhancer: Toggle Debug Mode', () => {
+					const cur = BE.settings.get('debug.verboseLogging');
+					BE.settings.set('debug.verboseLogging', !cur);
+					BE.modules.toast.show(`Debug mode ${!cur ? 'ON' : 'OFF'}`, 'info');
+				});
+			} catch (err) {
+				// Some managers (or contexts without menu support) may not have
+				// GM_registerMenuCommand available at all — this must not be fatal.
+				BE.log.warn('[Menu] registerMenuCommand unavailable', err);
+			}
+		}
+		return { register };
+	})();
 
-			// 1. IMMEDIATE UI INIT
-			BE.modules.ui.injectStyles();
-			BE.modules.ui.createToolbar();
+	/* ============================================================ *
+	 *  INITIALIZATION  (resilient bootstrap)
+	 * ============================================================ *
+	 *  Every stage is wrapped so that one broken module can never
+	 *  take down the rest of the script, and every failure/skip is
+	 *  logged with a reason instead of a silent `return`.
+	 * ============================================================ */
+	let _beInitialized = false;
+
+	function safeStage(name, fn) {
+		try {
+			fn();
+			BE.log.info(`[Init] ${name}: ok`);
+			return true;
+		} catch (err) {
+			BE.log.error(`[Init] ${name}: FAILED`, err);
+			return false;
+		}
+	}
+
+	BE.modules.init = function init() {
+		// Idempotent: calling BE.init()/BE.modules.init() twice (e.g. after an
+		// SPA navigation) must never create duplicate toolbars/listeners.
+		if (_beInitialized) {
+			BE.log.debug('[Init] already initialized, re-applying page-specific UI only');
+			refreshForCurrentPage();
+			return;
+		}
+		_beInitialized = true;
+
+		BE.log.info('[Init] Starting...');
+		BE.log.info(`[Init] Host: ${location.hostname}`);
+
+		BE.store.whenReady(() => {
+			let settingsOk = safeStage('Settings', () => BE.settings._load());
+			if (!settingsOk) {
+				BE.log.warn('[Init] Settings failed to load — continuing with schema defaults.');
+			}
+			BE.log.info('[Init] Settings loaded');
+
+			let adapter = null;
+			const adapterOk = safeStage('Adapter detection', () => {
+				adapter = BE.core.detectAdapter();
+			});
+			if (!adapterOk || !adapter) {
+				BE.log.error('[Init] Adapter detection failed: falling back to generic adapter.');
+				adapter = BE.adapters.registry.find((a) => a.id === 'generic') || null;
+			}
+			BE.adapters.active = adapter;
+			BE.log.info(`[Init] Adapter: ${adapter ? adapter.id : 'NONE'}`);
+
+			if (!adapter) {
+				BE.log.error('[Init] FATAL: no adapter available (not even generic). Booru Enhancer cannot run on this page.');
+				return;
+			}
+
+			// general.enabled may be undefined/corrupt in storage — treat
+			// anything except an explicit `false` as enabled.
+			const enabled = BE.settings.get('general.enabled') !== false;
+			if (!enabled) {
+				BE.log.info('[Init] Booru Enhancer is disabled in settings for this site. Registering menu command only.');
+				safeStage('Menu commands', () => BE.modules.menu.register());
+				return;
+			}
+
+			// 1. IMMEDIATE UI INIT — must appear regardless of storage/API state.
+			safeStage('UI styles', () => BE.modules.ui.injectStyles());
+			safeStage('Toolbar', () => BE.modules.ui.createToolbar());
+			safeStage('Post action bar', () => BE.modules.ui.createPostActionBar());
+			safeStage('Menu commands', () => BE.modules.menu.register());
+			BE.log.info('[Init] UI initialized');
 
 			// 2. IMMEDIATE GALLERY BINDING & LAYOUT
-			const container = BE.adapters.active.getGalleryContainer();
-			if (container) {
-				BE.modules.gallery.init(container);
-			}
+			let container = null;
+			safeStage('Gallery init', () => {
+				container = adapter.getGalleryContainer();
+				if (container) BE.modules.gallery.init(container);
+			});
+				BE.log.info(`[Init] Gallery initialized (container: ${container ? 'found' : 'none on this page'})`);
 
-			// 3. ASYNC METADATA ENRICHMENT
-			setTimeout(() => BE.modules.gallery.enrichThumbnails(), 0);
+				// 3. ASYNC METADATA ENRICHMENT — never blocks the UI above.
+				setTimeout(() => safeStage('Metadata enrichment', () => BE.modules.gallery.enrichThumbnails()), 0);
 
-			// 4. ASYNC INFINITE SCROLL PREP
-			if (BE.settings.get('gallery.infiniteScroll') && container) {
-				setTimeout(() => BE.modules.gallery.setupInfiniteScroll(), 1000);
-			}
+				// 4. ASYNC INFINITE SCROLL — set up as soon as the gallery exists,
+				// no arbitrary fixed delay beyond letting the container settle.
+				if (BE.settings.get('gallery.infiniteScroll') && container) {
+					safeStage('Infinite scroll', () => BE.modules.gallery.setupInfiniteScroll());
+				}
+
+				// 5. Viewer/hover/favorites are lazily initialized on first use,
+				// so a failure there can never block startup.
 		});
 	};
 
+	function refreshForCurrentPage() {
+		safeStage('Toolbar refresh', () => BE.modules.ui.createToolbar());
+		safeStage('Post action bar refresh', () => BE.modules.ui.createPostActionBar());
+		BE.modules.ui.invalidateCurrentPost();
+	}
+
+	/* ============================================================ *
+	 *  SPA / AJAX NAVIGATION HANDLING
+	 * ============================================================ *
+	 *  Sites like Danbooru/e621 can swap content via pushState/AJAX
+	 *  without a full reload. Re-detect state and refresh page-scoped
+	 *  UI (toolbar buttons, post action bar) without re-creating
+	 *  duplicate global UI (toolbar root/listeners are idempotent).
+	 * ============================================================ */
+	(function watchSpaNavigation() {
+		let lastUrl = location.href;
+		const onUrlChange = BE.dom.debounce(() => {
+			if (location.href === lastUrl) return;
+			lastUrl = location.href;
+			BE.log.debug('[Nav] URL changed, refreshing page-scoped UI');
+			safeStage('Adapter re-detect', () => { BE.adapters.active = BE.core.detectAdapter() || BE.adapters.active; });
+			refreshForCurrentPage();
+		}, 150);
+
+		for (const fnName of ['pushState', 'replaceState']) {
+			const orig = history[fnName];
+			history[fnName] = function patched(...args) {
+				const ret = orig.apply(this, args);
+				onUrlChange();
+				return ret;
+			};
+		}
+		window.addEventListener('popstate', onUrlChange);
+
+		// Fallback for sites that replace DOM content without touching the
+		// URL/history API at all. We only re-initialize when the container
+		// found by the adapter is genuinely a DIFFERENT element than the one
+		// the gallery module already owns — that distinguishes a true SPA
+		// content swap from unrelated mutations inside the same gallery,
+		// which must never reset pagination/loadedPostIds state.
+		const bodyObserver = new MutationObserver(BE.dom.debounce(() => {
+			if (!BE.adapters.active) return;
+			const container = BE.adapters.active.getGalleryContainer();
+			if (container && !container.dataset.beGalleryInit) {
+				BE.log.debug('[Nav] gallery container replaced, re-initializing gallery module');
+				safeStage('Gallery re-init', () => {
+					BE.modules.gallery.init(container);
+					if (BE.settings.get('gallery.infiniteScroll')) {
+						BE.modules.gallery.setupInfiniteScroll();
+					}
+					setTimeout(() => safeStage('Metadata enrichment (re-init)', () => BE.modules.gallery.enrichThumbnails()), 0);
+				});
+			}
+		}, 400));
+		BE.dom.ready(() => bodyObserver.observe(document.body, { childList: true, subtree: true }));
+	})();
+
 	BE.dom.ready(BE.modules.init);
+
+	// Public, idempotent entry point mentioned in the architecture spec —
+	// calling this more than once must never duplicate UI/listeners.
+	BE.init = BE.modules.init;
 })();
