@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Booru Enhancer
 // @namespace    https://sleazyfork.org/en/scripts/587810-booru-enhancer
-// @version      1.2.10
+// @version      1.2.11
 // @description  Modular enhancement suite for Danbooru/Gelbooru/Moebooru-family booru sites — original-quality media, smart downloads, fullscreen viewer, tag tools, blacklist filtering, infinite scroll, reverse image search, and more.
 // @author       itachi-re
 // @license      MIT
@@ -61,8 +61,34 @@
 
 /**
  * =============================================================================
- *  BOORU ENHANCER  —  v1.2.10
+ *  BOORU ENHANCER  —  v1.2.11
  * =============================================================================
+ *  CHANGELOG (1.2.10 → 1.2.11) — Safebooru / Gelbooru 0.2 layout fix
+ *  ------------------------------------------------------------------------
+ *  - Root cause of "only one tiny thumbnail per page, can't navigate or
+ *    download" on Safebooru: the gallery container was picked by a fixed
+ *    selector list ('#post-list-posts, #post-list, .content'). On Safebooru
+ *    '#post-list' is the WHOLE page row (sidebar + content, a flex row in
+ *    the site's own CSS), not the element that holds the thumbnails. The
+ *    script turned that row into a CSS grid, so the sidebar and the entire
+ *    thumbnail area were squeezed into two ~220px cells.
+ *  - The container is now derived from the thumbnails themselves: it is the
+ *    nearest element that actually holds the thumbnail wrappers (the
+ *    parent of the first thumbnail, or the lowest common ancestor of the
+ *    first two). This works for any layout and never picks the sidebar,
+ *    the page row, or <body>. Applies to the Gelbooru-family and generic
+ *    adapters; the old selector list is only a fallback for fetched pages.
+ *  - 'display:grid' is now !important: the site's own 'div#post-list
+ *    { display:flex }' (id selector) used to out-rank the script's class.
+ *  - Thumbnail wrappers get 'box-sizing:border-box' (Safebooru's .thumb has
+ *    10px padding, which made 100%-wide cells overflow their grid column).
+ *  - The grid fills the remaining width when its parent is a flex row (it
+ *    used to shrink-wrap to a single column next to the sidebar).
+ *  - Non-thumbnail children of the grid (paginator, clearfix, headings)
+ *    now span the full row instead of occupying a thumbnail cell.
+ *  - Thumbnails loaded by infinite scroll are inserted right after the
+ *    last existing thumbnail, not after the paginator/other trailing nodes.
+ *
  *  CHANGELOG (1.2.9 → 1.2.10) — original-quality downloads (Gelbooru)
  *  ------------------------------------------------------------------------
  *  - Fixed "Download" saving the resized sample / preview instead of the
@@ -179,7 +205,7 @@
 	window.__BOORU_ENHANCER_LOADED__ = true;
 
 	const BE = (window.BE = window.BE || {});
-	BE.VERSION = '1.2.10';
+	BE.VERSION = '1.2.11';
 
 	/* ============================================================ *
 	 *  EVENT BUS
@@ -756,6 +782,28 @@
 		return img.closest('a') || img.parentElement;
 	}
 
+	// Find the element that actually HOLDS the thumbnails: the parent of the
+	// first thumbnail wrapper, or — when the first two thumbnails are not
+	// siblings — their lowest common ancestor. Never returns <body>/<html>.
+	// Fixed selector lists were unreliable: on Safebooru '#post-list' is the
+	// whole page row (sidebar + content), not the thumbnail holder.
+	function containerFromThumbs(imgs, getWrapper) {
+		const wraps = [];
+		for (const img of imgs) {
+			let w = null;
+			try { w = getWrapper(img); } catch { w = null; }
+			if (w && !wraps.includes(w)) wraps.push(w);
+			if (wraps.length >= 2) break;
+		}
+		if (!wraps.length) return null;
+		let node = wraps[0].parentElement;
+		if (wraps.length > 1) {
+			while (node && !node.contains(wraps[1])) node = node.parentElement;
+		}
+		if (!node || node === node.ownerDocument.body || node === node.ownerDocument.documentElement) return null;
+		return node;
+	}
+
 	let _gelbooruObservedPageSize = null;
 
 	BE.core.registerAdapter({
@@ -783,7 +831,13 @@
 							getThumbWrapper: (img) => gelbooruThumbWrapper(img),
 							// Original URL taken from the page the user is actually on.
 							getOriginalUrl: (root = document) => gelbooruExtractOriginal(root, location.href) || null,
-							getGalleryContainer: (root = document) => root.querySelector('#post-list-posts, #post-list, .content'),
+							getGalleryContainer(root = document) {
+								// Derive the container from the thumbnails themselves (see containerFromThumbs).
+								const found = containerFromThumbs(this.getThumbElements(root), (img) => gelbooruThumbWrapper(img));
+								if (found) return found;
+								// Fetched pages (infinite scroll) may legitimately have no thumbnails (past the last page).
+								return root !== document ? root.querySelector('#post-list-posts, #post-list, .content') : null;
+							},
 							async fetchPost(id) {
 								// dapi is only trusted when it yields a real original URL.
 								let apiPost = null;
@@ -1225,7 +1279,12 @@
 								return (href.match(/(\d{3,})/) || [])[0] || href || null;
 							},
 							getThumbWrapper: (img) => img.closest('.thumbnail, .post-thumbnail, a') || img.parentElement,
-							getGalleryContainer: (root = document) => root.querySelector('.content, #post-list, body'),
+							getGalleryContainer(root = document) {
+								const found = containerFromThumbs(this.getThumbElements(root), (img) => this.getThumbWrapper(img));
+								if (found) return found;
+								// Never fall back to <body> on the live page; for fetched pages keep the old lookup.
+								return root !== document ? root.querySelector('.content, #post-list, body') : null;
+							},
 							async fetchPost() {
 								const img = BE.dom.qs('#image, #main_image, .image-container img, main img.post-image');
 								const video = BE.dom.qs('video source, video');
@@ -1914,6 +1973,20 @@
 			}
 			galleryContainer.dataset.beGalleryInit = '1';
 			galleryContainer.classList.add('be-gallery-grid');
+			// If the grid is (or sits inside) an item of a flex ROW — Safebooru's
+			// 'sidebar + content' layout — that item shrink-wraps its content and
+			// would leave the grid a single column wide. Let it fill the row.
+			try {
+				let node = galleryContainer;
+				for (let i = 0; i < 5 && node && node.parentElement && node !== document.body; i++) {
+					const cs = getComputedStyle(node.parentElement);
+					if (cs.display.includes('flex') && cs.flexDirection.startsWith('row')) {
+						node.classList.add('be-fill-flex');
+						break;
+					}
+					node = node.parentElement;
+				}
+			} catch { /* purely cosmetic */ }
 
 			// Event Delegation (attached exactly once per container).
 			// Requirement 4 / follow-up review: bubble phase, not capture.
@@ -2359,6 +2432,10 @@
 				}
 
 				let inserted = 0;
+				// Insert new thumbnails right after the last existing one (not after
+				// the paginator or other trailing nodes inside the container).
+				const existingWraps = galleryContainer.querySelectorAll('.be-thumb-wrap');
+				let insertAfter = existingWraps.length ? existingWraps[existingWraps.length - 1] : null;
 				for (const thumb of thumbs) {
 					const img = thumb.tagName === 'IMG' ? thumb : thumb.querySelector('img');
 					if (!img) continue;
@@ -2416,7 +2493,9 @@
 					const staleActions = clonedWrap.querySelector('.be-thumb-actions');
 					if (staleActions) staleActions.remove();
 
-					galleryContainer.appendChild(clonedWrap);
+					if (insertAfter && insertAfter.parentNode) insertAfter.after(clonedWrap);
+					else galleryContainer.appendChild(clonedWrap);
+					insertAfter = clonedWrap;
 					if (getComputedStyle(clonedWrap).position === 'static') clonedWrap.style.position = 'relative';
 					buildThumbActions(clonedWrap, clonedImg);
 
@@ -2484,7 +2563,12 @@
 				--be-accent: ${BE.settings.get('general.accentColor') || '#ff8ac6'};
 			}
 			.be-gallery-grid {
-				display: grid;
+				display: grid !important;
+				/* If the grid sits inside a flex row (Safebooru: sidebar + content),
+				   fill the remaining width instead of shrink-wrapping to 1 column. */
+				flex: 1 1 0%;
+				min-width: 0;
+				box-sizing: border-box;
 				grid-template-columns: var(--be-grid-template, repeat(auto-fill, minmax(var(--be-thumbnail-size, 220px), 1fr)));
 				gap: var(--be-grid-gap, 8px);
 				align-items: stretch;
@@ -2492,6 +2576,7 @@
 			.be-thumb-wrap {
 				position: relative;
 				overflow: hidden;
+				box-sizing: border-box;
 				min-width: 0;
 				min-height: 0;
 				aspect-ratio: 3/4;
@@ -2533,6 +2618,15 @@
 			.be-gallery-grid.be-compact-mode .be-thumb-action-btn {
 				padding: 1px 4px;
 				font-size: 10px;
+			}
+			/* Paginator, clearfix and other non-thumbnail children must not
+			   take up a thumbnail cell. */
+			.be-gallery-grid > :not(.be-thumb-wrap) {
+				grid-column: 1 / -1;
+			}
+			.be-fill-flex {
+				flex: 1 1 0% !important;
+				min-width: 0 !important;
 			}
 			.be-pagination-hidden {
 				display: none !important;
