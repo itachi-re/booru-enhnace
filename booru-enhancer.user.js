@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Booru Enhancer
 // @namespace    https://sleazyfork.org/en/scripts/587810-booru-enhancer
-// @version      1.2.9
+// @version      1.2.10
 // @description  Modular enhancement suite for Danbooru/Gelbooru/Moebooru-family booru sites — original-quality media, smart downloads, fullscreen viewer, tag tools, blacklist filtering, infinite scroll, reverse image search, and more.
 // @author       itachi-re
 // @license      MIT
@@ -61,8 +61,35 @@
 
 /**
  * =============================================================================
- *  BOORU ENHANCER  —  v1.2.9
+ *  BOORU ENHANCER  —  v1.2.10
  * =============================================================================
+ *  CHANGELOG (1.2.9 → 1.2.10) — original-quality downloads (Gelbooru)
+ *  ------------------------------------------------------------------------
+ *  - Fixed "Download" saving the resized sample / preview instead of the
+ *    full original on Gelbooru (e.g. post 7094291: 56 KB vs 1.2 MB). The
+ *    original URL is now resolved in strict priority order and a URL that
+ *    looks like a derived copy (/samples/, /thumbnails/, sample_*,
+ *    thumbnail_*) is never accepted as "original":
+ *      1. the "Original image" link in the post's Options list
+ *      2. a <video> source (video posts)
+ *      3. og:image / twitter:image meta tag (only if it is under /images/)
+ *      4. any other /images/ link that is not a sample/thumbnail
+ *    The displayed #image (a sample on Gelbooru) is only ever used as the
+ *    sampleUrl, never as a fallback for originalUrl.
+ *  - The Gelbooru dapi path (which now needs api_key/user_id for logged-out
+ *    users) is only trusted when it yields a real original URL; otherwise
+ *    the post page HTML is parsed. API results with a sample-looking
+ *    file_url are discarded.
+ *  - On a post page the toolbar Download/Open Original buttons now prefer
+ *    the original link that is actually on the page you are looking at.
+ *  - Downloader: GM_download now sends a Referer header, and the 8 s
+ *    "safety net" no longer fires while a large file is still downloading
+ *    (it used to trigger a second, duplicate browser download).
+ *  - Downloader: if only a sample/preview can be found, it still downloads
+ *    but tells you so with a warning toast instead of silently succeeding.
+ *  - "Open original" from the thumbnail action bar resolves the real
+ *    original first instead of opening the sample.
+ *
  *  CHANGELOG (1.2.8 → 1.2.9) — infinite-scroll thumbnails + Sankaku Complex
  *  ------------------------------------------------------------------------
  *  - Fixed infinite-scroll thumbnails never loading on sites that lazy-load
@@ -152,7 +179,7 @@
 	window.__BOORU_ENHANCER_LOADED__ = true;
 
 	const BE = (window.BE = window.BE || {});
-	BE.VERSION = '1.2.9';
+	BE.VERSION = '1.2.10';
 
 	/* ============================================================ *
 	 *  EVENT BUS
@@ -530,6 +557,17 @@
 		};
 	}
 
+	// True when a URL points at a resized/derived copy (sample or thumbnail)
+	// rather than the original file. Used to make sure a downloader never
+	// silently saves a preview as if it were the original.
+	function isDerivedUrl(url) {
+		if (!url) return false;
+		let p;
+		try { p = new URL(url, location.href).pathname; } catch { p = String(url).split('?')[0]; }
+		return /\/(?:thumbnails?|samples?|previews?)\//i.test(p)
+			|| /\/(?:sample|thumbnail|preview)_[^/]*$/i.test(p);
+	}
+
 	function guessMediaType(url) {
 		if (!url) return 'unknown';
 		const ext = (url.split('?')[0].split('.').pop() || '').toLowerCase();
@@ -743,15 +781,22 @@
 							// Gelbooru-family mirrors is otherwise too generic
 							// to trust blindly.
 							getThumbWrapper: (img) => gelbooruThumbWrapper(img),
+							// Original URL taken from the page the user is actually on.
+							getOriginalUrl: (root = document) => gelbooruExtractOriginal(root, location.href) || null,
 							getGalleryContainer: (root = document) => root.querySelector('#post-list-posts, #post-list, .content'),
 							async fetchPost(id) {
+								// dapi is only trusted when it yields a real original URL.
+								let apiPost = null;
 								try {
 									const posts = await gelbooruApiFetch([id]);
-									if (posts[0]) return posts[0];
+									apiPost = posts[0] || null;
+									if (apiPost?.originalUrl) return apiPost;
 								} catch (err) {
 									BE.log.warn('gelbooru: dapi fetchPost failed, falling back to HTML parse', err);
 								}
-								return gelbooruFetchPostHTML(id);
+								const htmlPost = await gelbooruFetchPostHTML(id);
+								if (htmlPost?.originalUrl) return htmlPost;
+								return apiPost || htmlPost;
 							},
 							async fetchThumbBatch(ids) {
 								if (!ids.length) return [];
@@ -869,13 +914,56 @@
 		return results;
 	}
 
+	// Resolve the ORIGINAL media URL from a Gelbooru-family post page
+	// (live document or a DOMParser document). Never returns a sample or
+	// thumbnail URL: on Gelbooru the visible #image is a resized sample, so
+	// it must not be used as a fallback here.
+	function gelbooruExtractOriginal(doc, base = location.href) {
+		const abs = (h) => {
+			if (!h) return '';
+			const u = safeURL(h, base);
+			return u && /^https?:$/.test(u.protocol) ? u.href : '';
+		};
+		const good = (u) => !!u && !isDerivedUrl(u);
+		const inImages = (u) => { const p = safeURL(u, base); return !!p && /\/images\//i.test(p.pathname); };
+
+		// 1. The "Original image" link in the Options list (strongest signal).
+		for (const a of doc.querySelectorAll('a[href]')) {
+			if (/^\s*original(\s+image)?\s*$/i.test(a.textContent || '')) {
+				const u = abs(a.getAttribute('href'));
+				if (good(u)) return u;
+			}
+		}
+		// 2. Video posts expose the original file as the <video> source.
+		for (const v of doc.querySelectorAll('video source[src], video[src]')) {
+			const u = abs(v.getAttribute('src'));
+			if (good(u)) return u;
+		}
+		// 3. og:image / twitter:image point at the original for image posts.
+		for (const sel of ['meta[property="og:image"]', 'meta[name="twitter:image"]']) {
+			const u = abs(doc.querySelector(sel)?.getAttribute('content'));
+			if (good(u) && inImages(u)) return u;
+		}
+		// 4. Any explicit download link, then any other /images/ link.
+		for (const a of doc.querySelectorAll('a.download-link[href], a[download][href]')) {
+			const u = abs(a.getAttribute('href'));
+			if (good(u)) return u;
+		}
+		for (const a of doc.querySelectorAll('a[href*="/images/"]')) {
+			const u = abs(a.getAttribute('href'));
+			if (good(u) && inImages(u) && /\.(?:jpe?g|png|gif|webp|bmp|mp4|webm|mov)(?:$|\?)/i.test(u)) return u;
+		}
+		return '';
+	}
+
 	function parseGelbooruPostHTML(html, id) {
 		const doc = new DOMParser().parseFromString(html, 'text/html');
 		const img = doc.querySelector('#image, img#image');
 		const video = doc.querySelector('video source, video#gelcomVideoPlayer source, video');
-		const originalLink = doc.querySelector('a.download-link, a[download], li a[href*="/samples/"], li a[href*="/images/"]');
-		const original = video?.getAttribute('src') || originalLink?.getAttribute('href') || img?.getAttribute('src') || '';
-		const sample = img?.getAttribute('src') || original;
+		const postPageUrl = `${location.origin}/index.php?page=post&s=view&id=${id}`;
+		const original = gelbooruExtractOriginal(doc, postPageUrl);
+		const sampleRaw = img?.getAttribute('src') || '';
+		const sample = (sampleRaw && safeURL(sampleRaw, postPageUrl)?.href) || original;
 		const tagLinks = Array.from(doc.querySelectorAll('.tag-list li, #tag-sidebar li, li[class*="tag-type-"]'));
 		const tags = [];
 		const artists = [], characters = [], copyrights = [];
@@ -894,6 +982,10 @@
 		const dims = (img?.getAttribute('data-original-width') && img?.getAttribute('data-original-height'))
 		? { w: Number(img.getAttribute('data-original-width')), h: Number(img.getAttribute('data-original-height')) }
 		: { w: img?.naturalWidth || 0, h: img?.naturalHeight || 0 };
+		if (!dims.w || !dims.h) {
+			const m = (doc.body?.textContent || '').match(/Size:\s*(\d+)\s*x\s*(\d+)/i);
+			if (m) { dims.w = Number(m[1]); dims.h = Number(m[2]); }
+		}
 
 		if (!original && !tags.length) return null;
 
@@ -915,13 +1007,16 @@
 	}
 
 	function normalizeGelbooru(d) {
-		const original = d.file_url || '';
+		// dapi's file_url is the original; if it ever looks like a sample or
+		// thumbnail, treat the original as unknown so the HTML path resolves it.
+		const fileUrl = d.file_url || '';
+		const original = isDerivedUrl(fileUrl) ? '' : fileUrl;
 		return emptyPost({
 			id: String(d.id),
 						 originalUrl: original,
-						 sampleUrl: d.sample_url || original,
-						 previewUrl: d.preview_url || d.sample_url || original,
-						 mediaType: guessMediaType(original),
+						 sampleUrl: d.sample_url || fileUrl,
+						 previewUrl: d.preview_url || d.sample_url || fileUrl,
+						 mediaType: guessMediaType(fileUrl),
 						 width: d.width || 0,
 						 height: d.height || 0,
 						 fileSize: d.file_size || 0,
@@ -1324,22 +1419,31 @@
 		}
 
 		async function resolveOriginalUrl(post) {
-			if (post?.originalUrl) return post;
-			BE.log.debug('[Download] no originalUrl yet, fetching metadata for', post?.id);
+			const usable = (p) => !!p?.originalUrl && !isDerivedUrl(p.originalUrl);
+			if (usable(post)) return post;
+			BE.log.debug('[Download] no usable originalUrl yet, fetching metadata for', post?.id);
+			const adapter = BE.adapters.active;
+
+			// On the post page itself, the original link in the DOM is exactly
+			// what the user sees, so it is the most trustworthy source.
 			try {
-				const fetched = await BE.adapters.active.fetchPost(post.id);
-				if (fetched?.originalUrl) return fetched;
+				if (typeof adapter?.getOriginalUrl === 'function' && adapter.isPostPage?.()
+					&& String(adapter.getPostId?.()) === String(post?.id)) {
+					const url = adapter.getOriginalUrl();
+					if (url && !isDerivedUrl(url)) return { ...post, originalUrl: url, mediaType: guessMediaType(url) !== 'unknown' ? guessMediaType(url) : post.mediaType };
+				}
+			} catch { /* ignore */ }
+
+			let fetched = null;
+			try {
+				fetched = await adapter.fetchPost(post.id);
+				if (usable(fetched)) return fetched;
 			} catch (err) {
 				BE.log.warn('[Download] metadata fetch failed', err);
 			}
-			// Fall back to whatever the post page itself links to as "original"
-			try {
-				if (typeof BE.adapters.active.getOriginalUrl === 'function') {
-					const url = BE.adapters.active.getOriginalUrl();
-					if (url) return { ...post, originalUrl: url };
-				}
-			} catch { /* ignore */ }
-			return post;
+			// Nothing usable: hand back the best we have (the caller warns if it
+			// is only a derived copy).
+			return fetched?.originalUrl ? fetched : post;
 		}
 
 		async function downloadPost(post) {
@@ -1351,15 +1455,17 @@
 
 			BE.modules.toast.show('Preparing download…', 'info', 1500);
 
-			let resolved = post;
-			if (!resolved.originalUrl) {
-				resolved = await resolveOriginalUrl(post);
-			}
+			let resolved = await resolveOriginalUrl(post);
 
 			if (!resolved.originalUrl) {
 				BE.log.warn('[Download] failed: no original URL could be resolved for', post.id);
 				BE.modules.toast.show('Download failed: could not find original media URL', 'error');
 				return false;
+			}
+
+			if (isDerivedUrl(resolved.originalUrl)) {
+				BE.log.warn('[Download] only a resized/preview URL could be found for', post.id, resolved.originalUrl);
+				BE.modules.toast.show('Warning: original not found — downloading the resized version', 'warn', 4000);
 			}
 
 			const filename = BE.naming.build(resolved) + '.' + BE.naming.extensionFor(resolved);
@@ -1370,9 +1476,12 @@
 
 			return new Promise((resolvePromise) => {
 				let settled = false;
+				let safetyTimer = null;
+				const stopSafety = () => { if (safetyTimer) { clearTimeout(safetyTimer); safetyTimer = null; } };
 				const finishOk = () => {
 					if (settled) return;
 					settled = true;
+					stopSafety();
 					BE.log.debug('[Download] complete', filename);
 					BE.modules.toast.show(`Download complete: ${filename}`, 'success');
 					resolvePromise(true);
@@ -1380,6 +1489,7 @@
 				const finishFail = (err) => {
 					if (settled) return;
 					settled = true;
+					stopSafety();
 					BE.log.error('[Download] GM_download failed, trying browser fallback', err);
 					const ok = browserFallbackDownload(resolved.originalUrl, filename);
 					if (ok) {
@@ -1395,6 +1505,10 @@
 						url: resolved.originalUrl,
 						name: filename,
 						saveAs: false,
+						// Some image CDNs only serve the full file with a site Referer.
+						headers: { Referer: `${location.origin}/` },
+						// Data is flowing: the download is alive, so disarm the safety net.
+						onprogress: stopSafety,
 						onload: finishOk,
 						onerror: finishFail,
 						ontimeout: finishFail,
@@ -1405,7 +1519,7 @@
 					}
 					// Safety net: if neither callback nor promise resolves within a
 					// reasonable time, fall back to a normal browser download.
-					setTimeout(() => { if (!settled) finishFail(new Error('GM_download timed out')); }, 8000);
+					safetyTimer = setTimeout(() => { if (!settled) finishFail(new Error('GM_download timed out')); }, 20000);
 				} catch (err) {
 					finishFail(err);
 				}
@@ -2015,7 +2129,8 @@
 			if (action === 'download') {
 				BE.modules.downloader.downloadPost(post);
 			} else if (action === 'open') {
-				const url = post.originalUrl || post.sampleUrl || post.previewUrl;
+				const resolvedPost = await BE.modules.downloader.resolveOriginalUrl(post);
+				const url = resolvedPost.originalUrl || resolvedPost.sampleUrl || resolvedPost.previewUrl;
 				if (url) window.open(url, '_blank', 'noopener');
 			} else if (action === 'favorite') {
 				BE.modules.favorites.toggle(post);
@@ -2539,7 +2654,15 @@
 				if (!isPost) return null;
 				const id = BE.adapters.active.getPostId?.();
 				if (!id) return null;
-				const post = await BE.adapters.active.fetchPost(id);
+				let post = await BE.adapters.active.fetchPost(id);
+				// Prefer the original link actually present on this page.
+				try {
+					const live = BE.adapters.active.getOriginalUrl?.();
+					if (live && !isDerivedUrl(live)) {
+						const mt = guessMediaType(live);
+						post = { ...(post || emptyPost({ id: String(id) })), originalUrl: live, mediaType: mt !== 'unknown' ? mt : (post?.mediaType || 'unknown') };
+					}
+				} catch { /* keep fetched post */ }
 				if (post) currentPostCache = post;
 				return post;
 			} catch (err) {
