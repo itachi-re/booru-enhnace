@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Booru Enhancer
 // @namespace    https://sleazyfork.org/en/scripts/587810-booru-enhancer
-// @version      1.2.8
+// @version      1.2.9
 // @description  Modular enhancement suite for Danbooru/Gelbooru/Moebooru-family booru sites — original-quality media, smart downloads, fullscreen viewer, tag tools, blacklist filtering, infinite scroll, reverse image search, and more.
 // @author       itachi-re
 // @license      MIT
@@ -61,8 +61,29 @@
 
 /**
  * =============================================================================
- *  BOORU ENHANCER  —  v1.2.7
+ *  BOORU ENHANCER  —  v1.2.9
  * =============================================================================
+ *  CHANGELOG (1.2.8 → 1.2.9) — infinite-scroll thumbnails + Sankaku Complex
+ *  ------------------------------------------------------------------------
+ *  - Fixed infinite-scroll thumbnails never loading on sites that lazy-load
+ *    thumbnails via data-src/data-srcset instead of src/srcset. Pages fetched
+ *    for infinite scroll are parsed in a detached document, so the site's
+ *    own lazy-load JS never runs against them; cloned thumbnails are now
+ *    resolved (data-src -> src, data-srcset -> srcset) before being attached,
+ *    matching the fallback already used elsewhere (viewer/action preview).
+ *  - Sankaku Complex (chan./idol./beta.sankakucomplex.com) has no dedicated
+ *    adapter and was silently falling back to the generic adapter, whose
+ *    selectors don't match Sankaku's markup — this was squishing the news
+ *    feed/tag directories into the thumbnail grid, mistaking the copyright
+ *    panel for tagging UI, and never finding real post content. Booru
+ *    Enhancer now detects this combination and skips every page-mutating
+ *    stage there (menu command still registers) until a real Sankaku
+ *    adapter ships, across initial init, SPA nav, and the DOM-mutation
+ *    fallback path.
+ *  - Fixed BE.VERSION constant ('1.2.7') having drifted out of sync with
+ *    the @version metadata (1.2.8) — it now matches, so exported settings
+ *    and the outgoing User-Agent header report the correct version.
+ *
  *  CHANGELOG (1.2.6 → 1.2.7) — regression-review follow-up
  *  ------------------------------------------------------------------------
  *  - Gallery click/hover delegation moved from capture phase to bubble
@@ -131,7 +152,7 @@
 	window.__BOORU_ENHANCER_LOADED__ = true;
 
 	const BE = (window.BE = window.BE || {});
-	BE.VERSION = '1.2.7';
+	BE.VERSION = '1.2.9';
 
 	/* ============================================================ *
 	 *  EVENT BUS
@@ -2251,6 +2272,26 @@
 					clonedImg.classList.add('be-thumb-img');
 					clonedImg.dataset.bePostId = postId;
 
+					// Fix: the fetched page is parsed in a detached DOMParser
+					// document, so none of the site's own lazy-load JS ever
+					// runs against it. On sites where thumbnails only carry
+					// the real image URL in data-src/data-srcset (the src
+					// itself being empty or a placeholder until the site's
+					// own scroll listener swaps it in), the cloned <img>
+					// would otherwise be appended with nothing for the
+					// browser to load — this is what was breaking infinite
+					// scroll on those sites (thumbnails from freshly-loaded
+					// pages never appearing). Resolve the lazy attributes
+					// into src/srcset ourselves before the node is attached,
+					// same fallback already used by openViewerForThumb/
+					// handleThumbAction elsewhere in this module.
+					if (!clonedImg.getAttribute('src') && clonedImg.dataset.src) {
+						clonedImg.src = clonedImg.dataset.src;
+					}
+					if (!clonedImg.getAttribute('srcset') && clonedImg.dataset.srcset) {
+						clonedImg.srcset = clonedImg.dataset.srcset;
+					}
+
 					// Requirement 18: cloneNode never carries over JS event
 					// state — the per-thumbnail hover action bar (built via
 					// direct pointerenter/pointerleave listeners, not
@@ -2804,6 +2845,21 @@
 	 * ============================================================ */
 	let _beInitialized = false;
 
+	// Fix: shared by every re-entry point below (initial init, SPA
+	// pushState/popstate nav, and the MutationObserver DOM-swap fallback).
+	// Sankaku Complex has no dedicated adapter, so it always resolves to
+	// the generic one, whose selectors were never written for Sankaku's
+	// markup (news feed, tag directories, copyright/disclaimer panel) and
+	// were mangling that layout. This must be checked in all four places,
+	// not just the initial init — otherwise SPA navigation or a DOM
+	// mutation on the page re-triggers gallery/UI mutation through a
+	// different path and undoes the bail-out.
+	function isUnsupportedGenericHost() {
+		return !!BE.adapters.active
+		&& BE.adapters.active.id === 'generic'
+		&& /(^|\.)sankakucomplex\.com$/.test(location.hostname);
+	}
+
 	function safeStage(name, fn) {
 		try {
 			fn();
@@ -2851,6 +2907,22 @@
 				return;
 			}
 
+			// Fix: see isUnsupportedGenericHost() above — Sankaku Complex
+			// falls through to the generic adapter, whose selectors were
+			// never written for its markup and were mangling the page
+			// (squished news/directory sections, copyright panel mistaken
+			// for post/tagging UI, real post content never found). Rather
+			// than guess at real selectors for markup this script has never
+			// actually parsed, bail out cleanly: register the menu command
+			// (so the site can still be toggled on manually once a real
+			// Sankaku adapter ships) but skip every stage that mutates the
+			// page.
+			if (isUnsupportedGenericHost()) {
+				BE.log.warn('[Init] Sankaku Complex has no dedicated adapter yet — skipping UI/gallery init to avoid mangling the page layout.');
+				safeStage('Menu commands', () => BE.modules.menu.register());
+				return;
+			}
+
 			// general.enabled may be undefined/corrupt in storage — treat
 			// anything except an explicit `false` as enabled.
 			const enabled = BE.settings.get('general.enabled') !== false;
@@ -2890,6 +2962,8 @@
 	};
 
 	function refreshForCurrentPage() {
+		// Fix: see isUnsupportedGenericHost() above.
+		if (isUnsupportedGenericHost()) return;
 		safeStage('Toolbar refresh', () => BE.modules.ui.createToolbar());
 		safeStage('Post action bar refresh', () => BE.modules.ui.createPostActionBar());
 		BE.modules.ui.invalidateCurrentPost();
@@ -2931,6 +3005,11 @@
 		// which must never reset pagination/loadedPostIds state.
 		const bodyObserver = new MutationObserver(BE.dom.debounce(() => {
 			if (!BE.adapters.active) return;
+			// Fix: see isUnsupportedGenericHost() above — without this,
+			// Sankaku's frequent DOM mutations (it's an SPA) would keep
+			// re-triggering gallery init through this fallback path even
+			// though the main init() bail-out above already skipped it.
+			if (isUnsupportedGenericHost()) return;
 			const container = BE.adapters.active.getGalleryContainer();
 			if (container && !container.dataset.beGalleryInit) {
 				BE.log.debug('[Nav] gallery container replaced, re-initializing gallery module');
